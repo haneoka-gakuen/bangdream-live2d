@@ -1,0 +1,47 @@
+name: Sync live2d-modified branch to Cloudflare R2
+
+on:
+  push:
+    branches: ["live2d-modified"]
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Install AWS CLI
+        run: |
+          curl "https://s3.amazonaws.com/aws-cli/awscli-bundle.zip" -o "awscli-bundle.zip"
+          unzip awscli-bundle.zip
+          sudo ./awscli-bundle/install -i /usr/local/aws -b /usr/local/bin/aws
+
+      - name: Configure AWS creds for R2
+        run: |
+          aws configure set aws_access_key_id      "$R2_ACCESS_KEY_ID"
+          aws configure set aws_secret_access_key  "$R2_SECRET_ACCESS_KEY"
+        env:
+          R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: Sync live2d branch to R2
+        env:
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          R2_BUCKET:   ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          echo "Using endpoint: $R2_ENDPOINT"
+          aws s3 sync . "s3://${R2_BUCKET}/live2d-modified/" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --exclude ".git/*" \
+            --exclude ".github/*" \
+            --exclude "awscli-bundle.zip" --exclude "awscli-bundle/*" \
+            --exclude "node_modules/*" \
+            --exclude "scripts/*" \
+            --exclude ".gitignore" \
+            --exclude "README.md" \
+            --delete
+          echo "::endgroup::"
