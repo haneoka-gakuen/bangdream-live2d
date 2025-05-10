@@ -1,0 +1,125 @@
+{
+  "unity_type": "AnimatorController",
+  "path_id": 1232832067405153143,
+  "name": "adv_live2d_umiri_008_live_01",
+  "data": {
+    "m_Name": "adv_live2d_umiri_008_live_01",
+    "m_ControllerSize": 616,
+    "m_Controller": {
+      "m_LayerArray": [
+        {
+          "data": {
+            "m_StateMachineIndex": 0,
+            "m_StateMachineSynchronizedLayerIndex": 0,
+            "m_BodyMask": {
+              "word0": 4294967295,
+              "word1": 4294967295,
+              "word2": 524287
+            },
+            "m_SkeletonMask": {
+              "data": {
+                "m_Data": []
+              }
+            },
+            "m_Binding": 756556552,
+            "(int&)m_LayerBlendingMode": 0,
+            "m_DefaultWeight": 0.0,
+            "m_IKPass": false,
+            "m_SyncedLayerAffectsTiming": false
+          }
+        }
+      ],
+      "m_StateMachineArray": [
+        {
+          "data": {
+            "m_StateConstantArray": [],
+            "m_AnyStateTransitionConstantArray": [],
+            "m_SelectorStateConstantArray": [
+              {
+                "data": {
+                  "m_TransitionConstantArray": [
+                    {
+                      "data": {
+                        "m_Destination": 4294967295,
+                        "m_ConditionConstantArray": []
+                      }
+                    }
+                  ],
+                  "m_FullPathID": 756556552,
+                  "m_IsEntry": true
+                }
+              },
+              {
+                "data": {
+                  "m_TransitionConstantArray": [
+                    {
+                      "data": {
+                        "m_Destination": 30000,
+                        "m_ConditionConstantArray": []
+                      }
+                    }
+                  ],
+                  "m_FullPathID": 756556552,
+                  "m_IsEntry": false
+                }
+              }
+            ],
+            "m_DefaultState": 0,
+            "m_SynchronizedLayerCount": 1
+          }
+        }
+      ],
+      "m_Values": {
+        "data": {
+          "m_ValueArray": []
+        }
+      },
+      "m_DefaultValues": {
+        "data": {
+          "m_PositionValues": [],
+          "m_QuaternionValues": [],
+          "m_ScaleValues": [],
+          "m_FloatValues": [],
+          "m_IntValues": [],
+          "m_BoolValues": [],
+          "m_EntityIdValues": []
+        }
+      }
+    },
+    "m_TOS": [
+      [
+        2105523844,
+        "GravityWeight"
+      ],
+      [
+        756556552,
+        "Base Layer"
+      ]
+    ],
+    "m_AnimationClips": [],
+    "m_StateMachineBehaviourVectorDescription": {
+      "m_StateMachineBehaviourRanges": [
+        [
+          {
+            "m_StateID": 756556552,
+            "m_LayerIndex": 0
+          },
+          {
+            "m_StartIndex": 0,
+            "m_Count": 1
+          }
+        ]
+      ],
+      "m_StateMachineBehaviourIndices": [
+        0
+      ]
+    },
+    "m_StateMachineBehaviours": [
+      {
+        "m_FileID": 0,
+        "m_PathID": -7624240622217591945
+      }
+    ],
+    "m_MultiThreadedStateMachine": true
+  }
+}

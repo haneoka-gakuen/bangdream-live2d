@@ -1,0 +1,47 @@
+{
+  "Version": 3,
+  "FileReferences": {
+    "Moc": "generated/live2d_sakiko_010_live_01_low.moc3",
+    "Textures": [
+      "live2d_sakiko_010_live_01_low.2048/texture_00.png",
+      "live2d_sakiko_010_live_01_low.2048/texture_01.png",
+      "live2d_sakiko_010_live_01_low.2048/texture_02.png"
+    ],
+    "Motions": {
+      "common": [
+        {
+          "File": "../common/motions/mtn_action_01.motion3.json"
+        },
+        {
+          "File": "../common/motions/mtn_finish_01.motion3.json"
+        },
+        {
+          "File": "../common/motions/mtn_idle_01.motion3.json"
+        },
+        {
+          "File": "../common/motions/mtn_play01_01.motion3.json"
+        },
+        {
+          "File": "../common/motions/mtn_play01_02.motion3.json"
+        },
+        {
+          "File": "../common/motions/mtn_play01_03.motion3.json"
+        },
+        {
+          "File": "../common/motions/mtn_play02_01.motion3.json"
+        },
+        {
+          "File": "../common/motions/mtn_play02_02.motion3.json"
+        },
+        {
+          "File": "../common/motions/mtn_play02_03.motion3.json"
+        }
+      ]
+    }
+  },
+  "Groups": [],
+  "HitAreas": [],
+  "_generated_by": "tools/extract_live2d_bundles.py",
+  "_source_note": "Created from Unity Cubism assets; motion curves are reconstructed from CubismFadeMotionData.",
+  "_model_name": "live2d_sakiko_010_live_01_low"
+}
