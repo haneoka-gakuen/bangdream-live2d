@@ -41,6 +41,11 @@ class BestdoriDownloader:
                 save_path.parent.mkdir(parents=True, exist_ok=True)
                 file_response = self.session.get(file_url)
                 file_response.raise_for_status()
+                content_type = file_response.headers.get('Content-Type', '')
+                content_start = file_response.content[:1024].lower()
+                if 'text/html' in content_type or b'<!doctype' in content_start or b'<!doctype' in file_response.content.lower():
+                    print(f"Skipped HTML response for {file_path} (URL: {file_url})")
+                    continue
                 with open(save_path, 'wb') as f:
                     f.write(file_response.content)
                 print(f"Downloaded: {file_path}")
