@@ -3,15 +3,26 @@ name: Sync live2d branch to Cloudflare R2
 on:
   push:
     branches: ["live2d"]
+  workflow_run:
+    workflows: ["Auto Update Live2D Assets"]
+    types: [completed]
   workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/live2d') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'live2d')
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: live2d
+          fetch-depth: 0
       
       - name: Install AWS CLI
         run: |
@@ -27,21 +38,118 @@ jobs:
           R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 
-      - name: Sync live2d branch to R2
+      - name: Upload changed files to R2
         env:
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           R2_BUCKET:   ${{ secrets.R2_BUCKET }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_AFTER: ${{ github.sha }}
+          WR_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           echo "Using endpoint: $R2_ENDPOINT"
-          aws s3 sync . "s3://${R2_BUCKET}/live2d/" \
-            --endpoint-url "$R2_ENDPOINT" \
-            --exclude ".git/*" \
-            --exclude ".github/*" \
-            --exclude "awscli-bundle.zip" --exclude "awscli-bundle/*" \
-            --exclude "node_modules/*" \
-            --exclude "scripts/*" \
-            --exclude ".gitignore" \
-            --exclude "README.md" \
-            --delete
-          echo "::endgroup::"
+          STATE_KEY="live2d/.sync-state/last_synced_sha.txt"
+          STATE_FILE="$(mktemp)"
+
+          should_sync_path() {
+            local p="$1"
+            case "$p" in
+              .git/*|.github/*|awscli-bundle.zip|awscli-bundle/*|node_modules/*|scripts/*|.gitignore|README.md)
+                return 1
+                ;;
+              *)
+                return 0
+                ;;
+            esac
+          }
+
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            AFTER="$PUSH_AFTER"
+          elif [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            AFTER="$WR_HEAD_SHA"
+          else
+            AFTER="$(git rev-parse HEAD)"
+          fi
+
+          if [[ -z "${AFTER:-}" ]]; then
+            echo "Cannot resolve AFTER commit SHA."
+            exit 1
+          fi
+
+          # Prefer the last successful sync point saved in R2. This allows
+          # automatic catch-up when previous sync runs failed.
+          BEFORE=""
+          if aws s3 cp "s3://${R2_BUCKET}/${STATE_KEY}" "$STATE_FILE" --endpoint-url "$R2_ENDPOINT" >/dev/null 2>&1; then
+            LAST_SYNCED_SHA="$(tr -d '\r\n' < "$STATE_FILE")"
+            if [[ -n "$LAST_SYNCED_SHA" ]] && git cat-file -e "${LAST_SYNCED_SHA}^{commit}" 2>/dev/null; then
+              if git merge-base --is-ancestor "$LAST_SYNCED_SHA" "$AFTER" 2>/dev/null; then
+                BEFORE="$LAST_SYNCED_SHA"
+                echo "Using last successful synced SHA from R2: $BEFORE"
+              else
+                echo "Last synced SHA is not an ancestor of target commit, will fallback."
+              fi
+            else
+              echo "Invalid last synced SHA state, will fallback."
+            fi
+          else
+            echo "No sync state found in R2, will fallback."
+          fi
+
+          if [[ -z "${BEFORE:-}" ]]; then
+            echo "No valid last_synced_sha in R2; fallback to full upload."
+            aws s3 sync . "s3://${R2_BUCKET}/live2d/" \
+              --endpoint-url "$R2_ENDPOINT" \
+              --exclude ".git/*" \
+              --exclude ".github/*" \
+              --exclude "awscli-bundle.zip" --exclude "awscli-bundle/*" \
+              --exclude "node_modules/*" \
+              --exclude "scripts/*" \
+              --exclude ".gitignore" \
+              --exclude "README.md" \
+              --delete
+            printf '%s\n' "$AFTER" > "$STATE_FILE"
+            aws s3 cp "$STATE_FILE" "s3://${R2_BUCKET}/${STATE_KEY}" --endpoint-url "$R2_ENDPOINT"
+            exit 0
+          fi
+
+          echo "Diff range: ${BEFORE}..${AFTER}"
+          mapfile -t CHANGES < <(git diff --name-status --find-renames "$BEFORE" "$AFTER")
+
+          if [[ "${#CHANGES[@]}" -eq 0 ]]; then
+            echo "No changed files, skipping upload."
+            printf '%s\n' "$AFTER" > "$STATE_FILE"
+            aws s3 cp "$STATE_FILE" "s3://${R2_BUCKET}/${STATE_KEY}" --endpoint-url "$R2_ENDPOINT"
+            exit 0
+          fi
+
+          for line in "${CHANGES[@]}"; do
+            IFS=$'\t' read -r status path1 path2 <<< "$line"
+            case "$status" in
+              D)
+                if should_sync_path "$path1"; then
+                  echo "Delete: $path1"
+                  aws s3 rm "s3://${R2_BUCKET}/live2d/${path1}" --endpoint-url "$R2_ENDPOINT"
+                fi
+                ;;
+              R*)
+                if should_sync_path "$path1"; then
+                  echo "Delete(renamed): $path1"
+                  aws s3 rm "s3://${R2_BUCKET}/live2d/${path1}" --endpoint-url "$R2_ENDPOINT"
+                fi
+                if should_sync_path "$path2"; then
+                  echo "Upload(renamed): $path2"
+                  aws s3 cp "$path2" "s3://${R2_BUCKET}/live2d/${path2}" --endpoint-url "$R2_ENDPOINT"
+                fi
+                ;;
+              *)
+                if should_sync_path "$path1"; then
+                  echo "Upload: $path1"
+                  aws s3 cp "$path1" "s3://${R2_BUCKET}/live2d/${path1}" --endpoint-url "$R2_ENDPOINT"
+                fi
+                ;;
+            esac
+          done
+
+          printf '%s\n' "$AFTER" > "$STATE_FILE"
+          aws s3 cp "$STATE_FILE" "s3://${R2_BUCKET}/${STATE_KEY}" --endpoint-url "$R2_ENDPOINT"
+          echo "Updated sync state to $AFTER"
