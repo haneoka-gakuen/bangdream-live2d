@@ -44,7 +44,6 @@ jobs:
           R2_BUCKET:   ${{ secrets.R2_BUCKET }}
           EVENT_NAME: ${{ github.event_name }}
           PUSH_AFTER: ${{ github.sha }}
-          WR_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           echo "Using endpoint: $R2_ENDPOINT"
@@ -66,7 +65,9 @@ jobs:
           if [[ "$EVENT_NAME" == "push" ]]; then
             AFTER="$PUSH_AFTER"
           elif [[ "$EVENT_NAME" == "workflow_run" ]]; then
-            AFTER="$WR_HEAD_SHA"
+            # workflow_run.head_sha is the commit that started the upstream
+            # workflow, not the commit it may have pushed before finishing.
+            AFTER="$(git rev-parse HEAD)"
           else
             AFTER="$(git rev-parse HEAD)"
           fi
