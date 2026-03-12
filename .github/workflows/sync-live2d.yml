@@ -49,29 +49,52 @@ jobs:
           echo "Using endpoint: $R2_ENDPOINT"
           STATE_KEY="live2d/.sync-state/last_synced_sha.txt"
           STATE_FILE="$(mktemp)"
+          ROOT_SYNC_DIRS=(data stamp changedstamp bilibili)
+          EXCLUDED_PATTERNS=(
+            ".git/*"
+            ".github/*"
+            ".gitignore"
+            "awscli-bundle.zip"
+            "awscli-bundle/*"
+            "node_modules/*"
+            "README.md"
+            "requirements.txt"
+            "scripts/*"
+          )
+
+          matches_any_pattern() {
+            local value="$1"
+            shift
+            local pattern
+            for pattern in "$@"; do
+              case "$value" in
+                $pattern)
+                  return 0
+                  ;;
+              esac
+            done
+            return 1
+          }
 
           should_sync_path() {
             local p="$1"
-            case "$p" in
-              .git/*|.github/*|awscli-bundle.zip|awscli-bundle/*|node_modules/*|scripts/*|.gitignore|README.md)
-                return 1
-                ;;
-              *)
-                return 0
-                ;;
-            esac
+            if matches_any_pattern "$p" "${EXCLUDED_PATTERNS[@]}"; then
+              return 1
+            fi
+            return 0
           }
 
           is_root_synced_path() {
             local p="$1"
-            case "$p" in
-              data/*|stamp/*|changedstamp/*)
-                return 0
-                ;;
-              *)
-                return 1
-                ;;
-            esac
+            local dir
+            for dir in "${ROOT_SYNC_DIRS[@]}"; do
+              case "$p" in
+                "$dir"/*)
+                  return 0
+                  ;;
+              esac
+            done
+            return 1
           }
 
           s3_key_for_path() {
@@ -96,6 +119,30 @@ jobs:
                 --recursive \
                 --endpoint-url "$R2_ENDPOINT" >/dev/null 2>&1 || true
             fi
+          }
+
+          sync_live2d_prefix() {
+            local args=(. "s3://${R2_BUCKET}/live2d/" --endpoint-url "$R2_ENDPOINT")
+            local pattern
+            local dir
+
+            for pattern in "${EXCLUDED_PATTERNS[@]}"; do
+              args+=(--exclude "$pattern")
+            done
+
+            for dir in "${ROOT_SYNC_DIRS[@]}"; do
+              args+=(--exclude "${dir}/*")
+            done
+
+            args+=(--delete)
+            aws s3 sync "${args[@]}"
+          }
+
+          sync_root_directories() {
+            local dir
+            for dir in "${ROOT_SYNC_DIRS[@]}"; do
+              sync_root_directory "$dir"
+            done
           }
 
           if [[ "$EVENT_NAME" == "push" ]]; then
@@ -134,40 +181,28 @@ jobs:
 
           if [[ -z "${BEFORE:-}" ]]; then
             echo "No valid last_synced_sha in R2; fallback to full upload."
-            aws s3 sync . "s3://${R2_BUCKET}/live2d/" \
-              --endpoint-url "$R2_ENDPOINT" \
-              --exclude ".git/*" \
-              --exclude ".github/*" \
-              --exclude ".gitignore" \
-              --exclude "awscli-bundle.zip" --exclude "awscli-bundle/*" \
-              --exclude "changedstamp/*" \
-              --exclude "data/*" \
-              --exclude "node_modules/*" \
-              --exclude "README.md" \
-              --exclude "requirements.txt" \
-              --exclude "scripts/*" \
-              --exclude "stamp/*" \
-              --delete
-            sync_root_directory "data"
-            sync_root_directory "stamp"
-            sync_root_directory "changedstamp"
+            sync_live2d_prefix
+            sync_root_directories
             printf '%s\n' "$AFTER" > "$STATE_FILE"
             aws s3 cp "$STATE_FILE" "s3://${R2_BUCKET}/${STATE_KEY}" --endpoint-url "$R2_ENDPOINT"
             exit 0
           fi
 
           echo "Diff range: ${BEFORE}..${AFTER}"
-          mapfile -t CHANGES < <(git diff --name-status --find-renames "$BEFORE" "$AFTER")
+          change_count=0
 
-          if [[ "${#CHANGES[@]}" -eq 0 ]]; then
-            echo "No changed files, skipping upload."
-            printf '%s\n' "$AFTER" > "$STATE_FILE"
-            aws s3 cp "$STATE_FILE" "s3://${R2_BUCKET}/${STATE_KEY}" --endpoint-url "$R2_ENDPOINT"
-            exit 0
-          fi
+          while IFS= read -r -d '' status; do
+            change_count=$((change_count + 1))
+            path1=""
+            path2=""
 
-          for line in "${CHANGES[@]}"; do
-            IFS=$'\t' read -r status path1 path2 <<< "$line"
+            if [[ "$status" == R* ]]; then
+              IFS= read -r -d '' path1
+              IFS= read -r -d '' path2
+            else
+              IFS= read -r -d '' path1
+            fi
+
             case "$status" in
               D)
                 if should_sync_path "$path1"; then
@@ -196,7 +231,14 @@ jobs:
                 fi
                 ;;
             esac
-          done
+          done < <(git -c core.quotePath=false diff --name-status --find-renames -z "$BEFORE" "$AFTER")
+
+          if [[ "$change_count" -eq 0 ]]; then
+            echo "No changed files, skipping upload."
+            printf '%s\n' "$AFTER" > "$STATE_FILE"
+            aws s3 cp "$STATE_FILE" "s3://${R2_BUCKET}/${STATE_KEY}" --endpoint-url "$R2_ENDPOINT"
+            exit 0
+          fi
 
           printf '%s\n' "$AFTER" > "$STATE_FILE"
           aws s3 cp "$STATE_FILE" "s3://${R2_BUCKET}/${STATE_KEY}" --endpoint-url "$R2_ENDPOINT"

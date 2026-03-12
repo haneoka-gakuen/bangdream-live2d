@@ -211,6 +211,12 @@ class BestdoriClient:
     def model_info_url(self, chara_id):
         return explorer_assets_url(chara_region(chara_id), f"live2d/chara/{chara_id}.json")
 
+    def fetch_indexed_directory_files(self, index_url, label):
+        remote_files = self.fetch_json(index_url)
+        if not isinstance(remote_files, list):
+            raise ValueError(f"Unexpected asset index for {label}")
+        return remote_files
+
     def download_file(self, file_url, save_path):
         with self.session.get(file_url, stream=True, timeout=REQUEST_TIMEOUT) as response:
             response.raise_for_status()
@@ -236,11 +242,7 @@ class BestdoriClient:
                         file_obj.write(chunk)
         return True
 
-    def download_indexed_directory(self, index_url, base_url, save_dir, label):
-        remote_files = self.fetch_json(index_url)
-        if not isinstance(remote_files, list):
-            raise ValueError(f"Unexpected asset index for {label}")
-
+    def download_indexed_directory(self, remote_files, base_url, save_dir, label):
         save_dir.mkdir(parents=True, exist_ok=True)
         existing_files = {
             path.relative_to(save_dir).as_posix()
@@ -272,13 +274,15 @@ class BestdoriClient:
 
     def download_model(self, chara_id, save_root):
         try:
+            label = chara_id
+            remote_files = self.fetch_indexed_directory_files(self.model_info_url(chara_id), label)
             return self.download_indexed_directory(
-                index_url=self.model_info_url(chara_id),
+                remote_files=remote_files,
                 base_url=assets_url(
                     chara_region(chara_id), f"live2d/chara/{chara_id}_rip/"
                 ),
                 save_dir=save_root / f"{chara_id}_rip",
-                label=chara_id,
+                label=label,
             )
         except Exception as exc:
             print(f"Failed to download {chara_id}: {exc}")
@@ -304,8 +308,26 @@ def update_reference_files(client):
         write_json_file(DATA_ROOT / file_name, data)
 
 
+def add_indexed_asset_info(info_by_group, target, remote_files):
+    group_name, asset_id = target["index_path"].split("/", 1)
+    group_info = info_by_group.setdefault(group_name, {})
+    region_info = group_info.setdefault(target["region"], {})
+    region_info[asset_id] = {
+        "assetPath": target["asset_path"],
+        "saveDir": target["save_dir"].as_posix(),
+        "fileCount": len(remote_files),
+        "files": remote_files,
+    }
+
+
+def write_indexed_asset_info_files(info_by_group):
+    for group_name, group_info in info_by_group.items():
+        write_json_file(Path(group_name) / "_info.json", group_info)
+
+
 def update_indexed_asset_files(client):
     failed_targets = []
+    info_by_group = {}
 
     for target in INDEXED_ASSET_TARGETS:
         region = target["region"]
@@ -315,8 +337,13 @@ def update_indexed_asset_files(client):
         label = f"{region}/{asset_path}"
         print(f"\n[*] Begin to download indexed assets: {label}")
         try:
+            remote_files = client.fetch_indexed_directory_files(
+                explorer_assets_url(region, f"{index_path}.json"),
+                label,
+            )
+            add_indexed_asset_info(info_by_group, target, remote_files)
             if client.download_indexed_directory(
-                index_url=explorer_assets_url(region, f"{index_path}.json"),
+                remote_files=remote_files,
                 base_url=assets_url(region, f"{asset_path}/"),
                 save_dir=save_dir,
                 label=label,
@@ -328,6 +355,8 @@ def update_indexed_asset_files(client):
         except Exception as exc:
             failed_targets.append(label)
             print(f"[*] Failed: {label} ({exc})")
+
+    write_indexed_asset_info_files(info_by_group)
 
     if failed_targets:
         print("\nFailed indexed asset directories:")
