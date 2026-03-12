@@ -62,6 +62,42 @@ jobs:
             esac
           }
 
+          is_root_synced_path() {
+            local p="$1"
+            case "$p" in
+              data/*|stamp/*|changedstamp/*)
+                return 0
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
+          s3_key_for_path() {
+            local p="$1"
+            if is_root_synced_path "$p"; then
+              printf '%s\n' "$p"
+            else
+              printf 'live2d/%s\n' "$p"
+            fi
+          }
+
+          sync_root_directory() {
+            local dir="$1"
+            if [[ -d "$dir" ]]; then
+              echo "Sync root directory: $dir/"
+              aws s3 sync "$dir" "s3://${R2_BUCKET}/${dir}/" \
+                --endpoint-url "$R2_ENDPOINT" \
+                --delete
+            else
+              echo "Local directory missing, removing remote root directory: $dir/"
+              aws s3 rm "s3://${R2_BUCKET}/${dir}/" \
+                --recursive \
+                --endpoint-url "$R2_ENDPOINT" >/dev/null 2>&1 || true
+            fi
+          }
+
           if [[ "$EVENT_NAME" == "push" ]]; then
             AFTER="$PUSH_AFTER"
           elif [[ "$EVENT_NAME" == "workflow_run" ]]; then
@@ -102,12 +138,19 @@ jobs:
               --endpoint-url "$R2_ENDPOINT" \
               --exclude ".git/*" \
               --exclude ".github/*" \
-              --exclude "awscli-bundle.zip" --exclude "awscli-bundle/*" \
-              --exclude "node_modules/*" \
-              --exclude "scripts/*" \
               --exclude ".gitignore" \
+              --exclude "awscli-bundle.zip" --exclude "awscli-bundle/*" \
+              --exclude "changedstamp/*" \
+              --exclude "data/*" \
+              --exclude "node_modules/*" \
               --exclude "README.md" \
+              --exclude "requirements.txt" \
+              --exclude "scripts/*" \
+              --exclude "stamp/*" \
               --delete
+            sync_root_directory "data"
+            sync_root_directory "stamp"
+            sync_root_directory "changedstamp"
             printf '%s\n' "$AFTER" > "$STATE_FILE"
             aws s3 cp "$STATE_FILE" "s3://${R2_BUCKET}/${STATE_KEY}" --endpoint-url "$R2_ENDPOINT"
             exit 0
@@ -128,24 +171,28 @@ jobs:
             case "$status" in
               D)
                 if should_sync_path "$path1"; then
-                  echo "Delete: $path1"
-                  aws s3 rm "s3://${R2_BUCKET}/live2d/${path1}" --endpoint-url "$R2_ENDPOINT"
+                  target_key="$(s3_key_for_path "$path1")"
+                  echo "Delete: $path1 -> $target_key"
+                  aws s3 rm "s3://${R2_BUCKET}/${target_key}" --endpoint-url "$R2_ENDPOINT"
                 fi
                 ;;
               R*)
                 if should_sync_path "$path1"; then
-                  echo "Delete(renamed): $path1"
-                  aws s3 rm "s3://${R2_BUCKET}/live2d/${path1}" --endpoint-url "$R2_ENDPOINT"
+                  target_key="$(s3_key_for_path "$path1")"
+                  echo "Delete(renamed): $path1 -> $target_key"
+                  aws s3 rm "s3://${R2_BUCKET}/${target_key}" --endpoint-url "$R2_ENDPOINT"
                 fi
                 if should_sync_path "$path2"; then
-                  echo "Upload(renamed): $path2"
-                  aws s3 cp "$path2" "s3://${R2_BUCKET}/live2d/${path2}" --endpoint-url "$R2_ENDPOINT"
+                  target_key="$(s3_key_for_path "$path2")"
+                  echo "Upload(renamed): $path2 -> $target_key"
+                  aws s3 cp "$path2" "s3://${R2_BUCKET}/${target_key}" --endpoint-url "$R2_ENDPOINT"
                 fi
                 ;;
               *)
                 if should_sync_path "$path1"; then
-                  echo "Upload: $path1"
-                  aws s3 cp "$path1" "s3://${R2_BUCKET}/live2d/${path1}" --endpoint-url "$R2_ENDPOINT"
+                  target_key="$(s3_key_for_path "$path1")"
+                  echo "Upload: $path1 -> $target_key"
+                  aws s3 cp "$path1" "s3://${R2_BUCKET}/${target_key}" --endpoint-url "$R2_ENDPOINT"
                 fi
                 ;;
             esac

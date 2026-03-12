@@ -27,6 +27,80 @@ INFO_FILE = Path("_info.json")
 DATA_ROOT = Path("data")
 BESTDORI_BASE_URL = "https://bestdori.com/"
 REGIONS = ("jp", "cn")
+INDEXED_ASSET_TARGETS = (
+    {
+        "region": "jp",
+        "index_path": "stamp/01",
+        "asset_path": "stamp/01_rip",
+        "save_dir": Path("stamp/01_rip"),
+    },
+    {
+        "region": "cn",
+        "index_path": "stamp/01",
+        "asset_path": "stamp/01_rip",
+        "save_dir": Path("stamp/cn/01_rip"),
+    },
+    {
+        "region": "jp",
+        "index_path": "changedstamp/001",
+        "asset_path": "changedstamp/001_rip",
+        "save_dir": Path("changedstamp/001_rip"),
+    },
+    {
+        "region": "cn",
+        "index_path": "changedstamp/001",
+        "asset_path": "changedstamp/001_rip",
+        "save_dir": Path("changedstamp/cn/001_rip"),
+    },
+    {
+        "region": "jp",
+        "index_path": "changedstamp/055",
+        "asset_path": "changedstamp/055_rip",
+        "save_dir": Path("changedstamp/055_rip"),
+    },
+    {
+        "region": "cn",
+        "index_path": "changedstamp/055",
+        "asset_path": "changedstamp/055_rip",
+        "save_dir": Path("changedstamp/cn/055_rip"),
+    },
+    {
+        "region": "jp",
+        "index_path": "changedstamp/056",
+        "asset_path": "changedstamp/056_rip",
+        "save_dir": Path("changedstamp/056_rip"),
+    },
+    {
+        "region": "cn",
+        "index_path": "changedstamp/056",
+        "asset_path": "changedstamp/056_rip",
+        "save_dir": Path("changedstamp/cn/056_rip"),
+    },
+    {
+        "region": "jp",
+        "index_path": "changedstamp/057",
+        "asset_path": "changedstamp/057_rip",
+        "save_dir": Path("changedstamp/057_rip"),
+    },
+    {
+        "region": "cn",
+        "index_path": "changedstamp/057",
+        "asset_path": "changedstamp/057_rip",
+        "save_dir": Path("changedstamp/cn/057_rip"),
+    },
+    {
+        "region": "cn",
+        "index_path": "changedstamp/10001",
+        "asset_path": "changedstamp/10001_rip",
+        "save_dir": Path("changedstamp/cn/10001_rip"),
+    },
+    {
+        "region": "cn",
+        "index_path": "changedstamp/10002",
+        "asset_path": "changedstamp/10002_rip",
+        "save_dir": Path("changedstamp/cn/10002_rip"),
+    },
+)
 REFERENCE_FILES = {
     "bands.all.1.json": "api/bands/all.1.json",
     "characters.all.5.json": "api/characters/all.5.json",
@@ -51,8 +125,8 @@ def explorer_assets_url(region, path=""):
     return bestdori_url(f"api/explorer/{region}/assets/{path}")
 
 
-def live2d_chara_assets_url(region, path=""):
-    return bestdori_url(f"assets/{region}/live2d/chara/{path}")
+def assets_url(region, path=""):
+    return bestdori_url(f"assets/{region}/{path}")
 
 
 def chara_region(chara_id):
@@ -137,15 +211,6 @@ class BestdoriClient:
     def model_info_url(self, chara_id):
         return explorer_assets_url(chara_region(chara_id), f"live2d/chara/{chara_id}.json")
 
-    def model_file_url(self, chara_id, file_path):
-        return live2d_chara_assets_url(chara_region(chara_id), f"{chara_id}_rip/{file_path}")
-
-    def fetch_model_index(self, chara_id):
-        index_data = self.fetch_json(self.model_info_url(chara_id))
-        if not isinstance(index_data, list):
-            raise ValueError(f"Unexpected model index for {chara_id}")
-        return index_data
-
     def download_file(self, file_url, save_path):
         with self.session.get(file_url, stream=True, timeout=REQUEST_TIMEOUT) as response:
             response.raise_for_status()
@@ -171,39 +236,50 @@ class BestdoriClient:
                         file_obj.write(chunk)
         return True
 
+    def download_indexed_directory(self, index_url, base_url, save_dir, label):
+        remote_files = self.fetch_json(index_url)
+        if not isinstance(remote_files, list):
+            raise ValueError(f"Unexpected asset index for {label}")
+
+        save_dir.mkdir(parents=True, exist_ok=True)
+        existing_files = {
+            path.relative_to(save_dir).as_posix()
+            for path in save_dir.rglob("*")
+            if path.is_file()
+        }
+        missing_files = [
+            file_path for file_path in remote_files if file_path not in existing_files
+        ]
+
+        if not missing_files:
+            print(f"No missing files for {label}")
+            return True
+
+        print(f"{label}: {len(missing_files)} files to download")
+        all_succeeded = True
+
+        for file_path in missing_files:
+            file_url = urljoin(base_url, file_path)
+            save_path = save_dir / file_path
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if self.download_file(file_url, save_path):
+                print(f"Downloaded: {file_path}")
+            else:
+                all_succeeded = False
+
+        return all_succeeded
+
     def download_model(self, chara_id, save_root):
         try:
-            chara_dir = save_root / f"{chara_id}_rip"
-            chara_dir.mkdir(parents=True, exist_ok=True)
-
-            remote_files = self.fetch_model_index(chara_id)
-            existing_files = {
-                path.relative_to(chara_dir).as_posix()
-                for path in chara_dir.rglob("*")
-                if path.is_file()
-            }
-            missing_files = [
-                file_path for file_path in remote_files if file_path not in existing_files
-            ]
-
-            if not missing_files:
-                print(f"No missing files for {chara_id}")
-                return True
-
-            print(f"{chara_id}: {len(missing_files)} files to download")
-            all_succeeded = True
-
-            for file_path in missing_files:
-                file_url = self.model_file_url(chara_id, file_path)
-                save_path = chara_dir / file_path
-                save_path.parent.mkdir(parents=True, exist_ok=True)
-
-                if self.download_file(file_url, save_path):
-                    print(f"Downloaded: {file_path}")
-                else:
-                    all_succeeded = False
-
-            return all_succeeded
+            return self.download_indexed_directory(
+                index_url=self.model_info_url(chara_id),
+                base_url=assets_url(
+                    chara_region(chara_id), f"live2d/chara/{chara_id}_rip/"
+                ),
+                save_dir=save_root / f"{chara_id}_rip",
+                label=chara_id,
+            )
         except Exception as exc:
             print(f"Failed to download {chara_id}: {exc}")
             return False
@@ -228,11 +304,43 @@ def update_reference_files(client):
         write_json_file(DATA_ROOT / file_name, data)
 
 
+def update_indexed_asset_files(client):
+    failed_targets = []
+
+    for target in INDEXED_ASSET_TARGETS:
+        region = target["region"]
+        index_path = target["index_path"]
+        asset_path = target["asset_path"]
+        save_dir = target["save_dir"]
+        label = f"{region}/{asset_path}"
+        print(f"\n[*] Begin to download indexed assets: {label}")
+        try:
+            if client.download_indexed_directory(
+                index_url=explorer_assets_url(region, f"{index_path}.json"),
+                base_url=assets_url(region, f"{asset_path}/"),
+                save_dir=save_dir,
+                label=label,
+            ):
+                print(f"[*] Success: {label}")
+            else:
+                failed_targets.append(label)
+                print(f"[*] Failed: {label}")
+        except Exception as exc:
+            failed_targets.append(label)
+            print(f"[*] Failed: {label} ({exc})")
+
+    if failed_targets:
+        print("\nFailed indexed asset directories:")
+        for label in failed_targets:
+            print(label)
+
+
 def main():
     client = BestdoriClient()
 
     try:
         update_reference_files(client)
+        update_indexed_asset_files(client)
 
         chara_data = client.fetch_all_chara_info()
         write_info_file(chara_data)
