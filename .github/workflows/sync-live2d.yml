@@ -42,15 +42,12 @@ jobs:
         env:
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           R2_BUCKET:   ${{ secrets.R2_BUCKET }}
-          EVENT_NAME: ${{ github.event_name }}
-          PUSH_AFTER: ${{ github.sha }}
         run: |
           set -euo pipefail
           echo "Using endpoint: $R2_ENDPOINT"
           STATE_KEY="live2d/.sync-state/last_synced_sha.txt"
           STATE_FILE="$(mktemp)"
-          LOCAL_LIVE2D_DIR="live2d"
-          ROOT_SYNC_DIRS=(data stamp changedstamp sdchara bilibili)
+          ROOT_SYNC_DIRS=(live2d data stamp changedstamp sdchara bilibili)
           EXCLUDED_PATTERNS=(
             ".git/*"
             ".github/*"
@@ -82,19 +79,10 @@ jobs:
             if matches_any_pattern "$p" "${EXCLUDED_PATTERNS[@]}"; then
               return 1
             fi
+            if ! is_root_synced_path "$p"; then
+              return 1
+            fi
             return 0
-          }
-
-          is_local_live2d_path() {
-            local p="$1"
-            case "$p" in
-              "$LOCAL_LIVE2D_DIR"/*)
-                return 0
-                ;;
-              *)
-                return 1
-                ;;
-            esac
           }
 
           is_root_synced_path() {
@@ -108,17 +96,6 @@ jobs:
               esac
             done
             return 1
-          }
-
-          s3_key_for_path() {
-            local p="$1"
-            if is_root_synced_path "$p"; then
-              printf '%s\n' "$p"
-            elif is_local_live2d_path "$p"; then
-              printf '%s\n' "$p"
-            else
-              printf 'live2d/%s\n' "$p"
-            fi
           }
 
           sync_root_directory() {
@@ -136,49 +113,6 @@ jobs:
             fi
           }
 
-          is_root_synced_dir_name() {
-            local name="$1"
-            local dir
-            for dir in "${ROOT_SYNC_DIRS[@]}"; do
-              if [[ "$name" == "$dir" ]]; then
-                return 0
-              fi
-            done
-            return 1
-          }
-
-          sync_live2d_prefix() {
-            local staging_dir
-            local entry
-
-            staging_dir="$(mktemp -d)"
-
-            if [[ -d "$LOCAL_LIVE2D_DIR" ]]; then
-              cp -al "${LOCAL_LIVE2D_DIR}/." "$staging_dir/"
-            fi
-
-            while IFS= read -r -d '' entry; do
-              if [[ "$entry" == "$LOCAL_LIVE2D_DIR" ]]; then
-                continue
-              fi
-
-              if is_root_synced_dir_name "$entry"; then
-                continue
-              fi
-
-              if matches_any_pattern "$entry" "${EXCLUDED_PATTERNS[@]}"; then
-                continue
-              fi
-
-              cp -al "$entry" "$staging_dir/"
-            done < <(find . -mindepth 1 -maxdepth 1 -printf '%P\0')
-
-            aws s3 sync "$staging_dir/" "s3://${R2_BUCKET}/live2d/" \
-              --endpoint-url "$R2_ENDPOINT" \
-              --delete
-            rm -rf "$staging_dir"
-          }
-
           sync_root_directories() {
             local dir
             for dir in "${ROOT_SYNC_DIRS[@]}"; do
@@ -186,15 +120,8 @@ jobs:
             done
           }
 
-          if [[ "$EVENT_NAME" == "push" ]]; then
-            AFTER="$PUSH_AFTER"
-          elif [[ "$EVENT_NAME" == "workflow_run" ]]; then
-            # workflow_run.head_sha is the commit that started the upstream
-            # workflow, not the commit it may have pushed before finishing.
-            AFTER="$(git rev-parse HEAD)"
-          else
-            AFTER="$(git rev-parse HEAD)"
-          fi
+          # We always sync the checked-out live2d branch head.
+          AFTER="$(git rev-parse HEAD)"
 
           if [[ -z "${AFTER:-}" ]]; then
             echo "Cannot resolve AFTER commit SHA."
@@ -222,7 +149,6 @@ jobs:
 
           if [[ -z "${BEFORE:-}" ]]; then
             echo "No valid last_synced_sha in R2; fallback to full upload."
-            sync_live2d_prefix
             sync_root_directories
             printf '%s\n' "$AFTER" > "$STATE_FILE"
             aws s3 cp "$STATE_FILE" "s3://${R2_BUCKET}/${STATE_KEY}" --endpoint-url "$R2_ENDPOINT"
@@ -247,42 +173,24 @@ jobs:
             case "$status" in
               D)
                 if should_sync_path "$path1"; then
-                  target_key="$(s3_key_for_path "$path1")"
-                  echo "Delete: $path1 -> $target_key"
-                  aws s3 rm "s3://${R2_BUCKET}/${target_key}" --endpoint-url "$R2_ENDPOINT"
+                  echo "Delete: $path1"
+                  aws s3 rm "s3://${R2_BUCKET}/${path1}" --endpoint-url "$R2_ENDPOINT"
                 fi
                 ;;
               R*)
                 if should_sync_path "$path1"; then
-                  old_target_key="$(s3_key_for_path "$path1")"
-                else
-                  old_target_key=""
+                  echo "Delete(renamed): $path1"
+                  aws s3 rm "s3://${R2_BUCKET}/${path1}" --endpoint-url "$R2_ENDPOINT"
                 fi
                 if should_sync_path "$path2"; then
-                  new_target_key="$(s3_key_for_path "$path2")"
-                else
-                  new_target_key=""
-                fi
-
-                if [[ -n "$old_target_key" && -n "$new_target_key" && "$old_target_key" == "$new_target_key" ]]; then
-                  echo "Skip local-only rename: $path1 -> $path2 (target unchanged: $new_target_key)"
-                  continue
-                fi
-
-                if [[ -n "$old_target_key" ]]; then
-                  echo "Delete(renamed): $path1 -> $old_target_key"
-                  aws s3 rm "s3://${R2_BUCKET}/${old_target_key}" --endpoint-url "$R2_ENDPOINT"
-                fi
-                if [[ -n "$new_target_key" ]]; then
-                  echo "Upload(renamed): $path2 -> $new_target_key"
-                  aws s3 cp "$path2" "s3://${R2_BUCKET}/${new_target_key}" --endpoint-url "$R2_ENDPOINT"
+                  echo "Upload(renamed): $path2"
+                  aws s3 cp "$path2" "s3://${R2_BUCKET}/${path2}" --endpoint-url "$R2_ENDPOINT"
                 fi
                 ;;
               *)
                 if should_sync_path "$path1"; then
-                  target_key="$(s3_key_for_path "$path1")"
-                  echo "Upload: $path1 -> $target_key"
-                  aws s3 cp "$path1" "s3://${R2_BUCKET}/${target_key}" --endpoint-url "$R2_ENDPOINT"
+                  echo "Upload: $path1"
+                  aws s3 cp "$path1" "s3://${R2_BUCKET}/${path1}" --endpoint-url "$R2_ENDPOINT"
                 fi
                 ;;
             esac

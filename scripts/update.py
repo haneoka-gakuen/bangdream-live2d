@@ -22,9 +22,6 @@ DEFAULT_HEADERS = {
     "Pragma": "no-cache",
 }
 REQUEST_TIMEOUT = 30
-LOCAL_LIVE2D_ROOT = Path("live2d")
-CHARA_ROOT = LOCAL_LIVE2D_ROOT / "chara"
-INFO_FILE = LOCAL_LIVE2D_ROOT / "_info.json"
 DATA_ROOT = Path("data")
 BESTDORI_BASE_URL = "https://bestdori.com/"
 REGIONS = ("jp", "cn")
@@ -32,32 +29,78 @@ DIRECTORY_ASSET_TARGETS = (
     {
         "region": "jp",
         "root_path": "stamp",
+        "discovery_mode": "tree_leaves",
         "save_layout": "split_region",
+        "dedupe_mode": "full",
+        "info_mode": "listing",
+        "prefilter": "none",
     },
     {
         "region": "cn",
         "root_path": "stamp",
+        "discovery_mode": "tree_leaves",
         "save_layout": "split_region",
+        "dedupe_mode": "full",
+        "info_mode": "listing",
+        "prefilter": "none",
     },
     {
         "region": "jp",
         "root_path": "changedstamp",
+        "discovery_mode": "tree_leaves",
         "save_layout": "split_region",
+        "dedupe_mode": "full",
+        "info_mode": "listing",
+        "prefilter": "none",
     },
     {
         "region": "cn",
         "root_path": "changedstamp",
+        "discovery_mode": "tree_leaves",
         "save_layout": "split_region",
+        "dedupe_mode": "full",
+        "info_mode": "listing",
+        "prefilter": "none",
     },
     {
         "region": "jp",
         "root_path": "sdchara",
+        "discovery_mode": "tree_leaves",
         "save_layout": "shared",
+        "dedupe_mode": "full",
+        "info_mode": "listing",
+        "prefilter": "none",
     },
     {
         "region": "cn",
         "root_path": "sdchara",
+        "discovery_mode": "tree_leaves",
         "save_layout": "shared",
+        "dedupe_mode": "full",
+        "info_mode": "listing",
+        "prefilter": "none",
+    },
+    {
+        "region": "jp",
+        "root_path": "live2d",
+        "discovery_mode": "count_map_branch",
+        "discovery_root_path": "live2d/chara",
+        "save_layout": "shared",
+        "dedupe_mode": "save_dir",
+        "info_mode": "count_map",
+        "info_root_path": "live2d/chara",
+        "prefilter": "count_map_prefix_group",
+    },
+    {
+        "region": "cn",
+        "root_path": "live2d",
+        "discovery_mode": "count_map_branch",
+        "discovery_root_path": "live2d/chara",
+        "save_layout": "shared",
+        "dedupe_mode": "save_dir",
+        "info_mode": "count_map",
+        "info_root_path": "live2d/chara",
+        "prefilter": "count_map_prefix_group",
     },
 )
 REFERENCE_FILES = {
@@ -98,44 +141,16 @@ def build_session():
     return session
 
 
-def collect_local_file_counts(chara_root):
+def collect_local_file_counts(root_dir):
     counts = {}
-    if not chara_root.exists():
-        chara_root.mkdir(parents=True, exist_ok=True)
+    if not root_dir.exists():
+        root_dir.mkdir(parents=True, exist_ok=True)
         return counts
 
-    for folder in chara_root.iterdir():
+    for folder in root_dir.iterdir():
         if folder.is_dir():
             counts[folder.name] = sum(1 for path in folder.rglob("*") if path.is_file())
     return counts
-
-
-def build_related_ids_by_prefix(local_folder_names):
-    related_ids = {}
-    for folder_name in local_folder_names:
-        if not folder_name.endswith("_rip"):
-            continue
-        chara_id = folder_name[:-4]
-        prefix = chara_id.split("_", 1)[0]
-        related_ids.setdefault(prefix, set()).add(chara_id)
-    return related_ids
-
-
-def find_models_to_update(chara_data, local_counts):
-    missing_models = set()
-    related_ids_by_prefix = build_related_ids_by_prefix(local_counts.keys())
-
-    for chara_id, expected_count in chara_data.items():
-        local_count = local_counts.get(f"{chara_id}_rip", 0)
-        if local_count >= expected_count:
-            continue
-
-        missing_models.add(chara_id)
-        prefix = chara_id.split("_", 1)[0]
-        missing_models.update(related_ids_by_prefix.get(prefix, set()))
-
-    return sorted(missing_models)
-
 
 class BestdoriClient:
     def __init__(self):
@@ -215,11 +230,6 @@ class BestdoriClient:
 
         return all_succeeded
 
-def write_info_file(chara_data):
-    with INFO_FILE.open("w", encoding="utf-8") as file_obj:
-        json.dump(chara_data, file_obj, ensure_ascii=False, separators=(",", ":"))
-    print(f"Updated `{INFO_FILE.as_posix()}`")
-
 
 def write_json_file(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -239,6 +249,22 @@ def add_indexed_asset_info(info_by_group, target, remote_files):
     group_name = parts[0]
     asset_id = parts[1] if len(parts) == 2 else "_root"
     group_info = info_by_group.setdefault(group_name, {})
+
+    if target["save_layout"] == "shared":
+        entry = group_info.setdefault(
+            asset_id,
+            {
+                "assetPath": target["asset_path"],
+                "saveDir": target["save_dir"].as_posix(),
+                "fileCount": 0,
+                "files": [],
+            },
+        )
+        merged_files = sorted(set(entry["files"]).union(remote_files))
+        entry["fileCount"] = len(merged_files)
+        entry["files"] = merged_files
+        return
+
     region_info = group_info.setdefault(target["region"], {})
     region_info[asset_id] = {
         "assetPath": target["asset_path"],
@@ -259,14 +285,14 @@ def get_asset_tree_node(tree, path):
     return node
 
 
-def iter_leaf_asset_paths(node, prefix):
+def iter_leaf_assets(node, prefix):
     if isinstance(node, dict):
         for name, child in node.items():
             child_prefix = f"{prefix}/{name}" if prefix else name
-            yield from iter_leaf_asset_paths(child, child_prefix)
+            yield from iter_leaf_assets(child, child_prefix)
         return
 
-    yield prefix
+    yield prefix, node
 
 
 def asset_path_for_leaf(leaf_path):
@@ -292,27 +318,55 @@ def save_dir_for_leaf(region, leaf_path, save_layout):
 def expand_directory_asset_target(client, target):
     region = target["region"]
     root_path = target["root_path"]
+    discovery_mode = target["discovery_mode"]
     save_layout = target["save_layout"]
+    dedupe_mode = target["dedupe_mode"]
+    info_mode = target["info_mode"]
+    prefilter = target["prefilter"]
     tree = client.fetch_asset_tree(region)
-    node = get_asset_tree_node(tree, root_path)
-    if node is None:
-        raise ValueError(f"Directory asset target not found: {region}/{root_path}")
-
     expanded_targets = []
-    for leaf_path in iter_leaf_asset_paths(node, root_path):
+
+    if discovery_mode == "tree_leaves":
+        node = get_asset_tree_node(tree, root_path)
+        if node is None:
+            raise ValueError(f"Directory asset target not found: {region}/{root_path}")
+        leaf_entries = iter_leaf_assets(node, root_path)
+    elif discovery_mode == "count_map_branch":
+        discovery_root_path = target["discovery_root_path"]
+        node = get_asset_tree_node(tree, discovery_root_path)
+        if not isinstance(node, dict):
+            raise ValueError(
+                f"Count-map discovery target not found: {region}/{discovery_root_path}"
+            )
+        leaf_entries = (
+            (f"{discovery_root_path}/{leaf_id}", expected_count)
+            for leaf_id, expected_count in node.items()
+        )
+    else:
+        raise ValueError(f"Unknown discovery mode: {discovery_mode}")
+
+    for leaf_path, expected_count in leaf_entries:
         expanded_targets.append(
             {
                 "region": region,
+                "root_path": root_path,
                 "index_path": leaf_path,
+                "leaf_path": leaf_path,
                 "asset_path": asset_path_for_leaf(leaf_path),
                 "save_dir": save_dir_for_leaf(region, leaf_path, save_layout),
+                "expected_count": expected_count,
+                "save_layout": save_layout,
+                "dedupe_mode": dedupe_mode,
+                "info_mode": info_mode,
+                "info_root_path": target.get("info_root_path"),
+                "prefilter": prefilter,
             }
         )
 
     return expanded_targets
 
 
-def build_indexed_asset_targets(client):
+def build_asset_targets(client):
     targets = []
     for target in DIRECTORY_ASSET_TARGETS:
         targets.extend(expand_directory_asset_target(client, target))
@@ -320,12 +374,15 @@ def build_indexed_asset_targets(client):
     deduped_targets = []
     seen = set()
     for target in targets:
-        key = (
-            target["region"],
-            target["index_path"],
-            target["asset_path"],
-            target["save_dir"].as_posix(),
-        )
+        if target["dedupe_mode"] == "save_dir":
+            key = ("save_dir", target["save_dir"].as_posix())
+        else:
+            key = (
+                target["region"],
+                target["index_path"],
+                target["asset_path"],
+                target["save_dir"].as_posix(),
+            )
         if key in seen:
             continue
         seen.add(key)
@@ -334,44 +391,130 @@ def build_indexed_asset_targets(client):
     return deduped_targets
 
 
-def build_live2d_chara_targets(client):
-    chara_data = {}
-    targets = []
-
-    for region in REGIONS:
-        chara_node = get_asset_tree_node(client.fetch_asset_tree(region), "live2d/chara")
-        if not isinstance(chara_node, dict):
-            raise ValueError(f"Missing live2d/chara asset tree for region: {region}")
-
-        for chara_id, expected_count in sorted(chara_node.items()):
-            if chara_id in chara_data:
-                continue
-
-            chara_data[chara_id] = expected_count
-            targets.append(
-                {
-                    "region": region,
-                    "chara_id": chara_id,
-                    "index_path": f"live2d/chara/{chara_id}",
-                    "asset_path": f"live2d/chara/{chara_id}_rip",
-                    "save_dir": CHARA_ROOT / f"{chara_id}_rip",
-                }
-            )
-
-    return chara_data, targets
-
-
 def write_indexed_asset_info_files(info_by_group):
     for group_name, group_info in info_by_group.items():
         write_json_file(Path(group_name) / "_info.json", group_info)
 
 
-def update_indexed_asset_files(client):
+def relative_leaf_id(root_path, leaf_path):
+    if leaf_path == root_path:
+        return "_root"
+    return leaf_path[len(root_path) + 1 :]
+
+
+def write_count_map_info_files(asset_targets):
+    info_outputs = {}
+
+    for target in asset_targets:
+        if target["info_mode"] != "count_map":
+            continue
+
+        info_root_path = target.get("info_root_path", target["root_path"])
+        info_key = relative_leaf_id(info_root_path, target["leaf_path"])
+        info_path = Path(target["root_path"]) / "_info.json"
+        output = info_outputs.setdefault(info_path.as_posix(), {"path": info_path, "data": {}})
+        output["data"][info_key] = max(
+            output["data"].get(info_key, 0),
+            target["expected_count"],
+        )
+
+    for output in info_outputs.values():
+        write_json_file(output["path"], output["data"])
+
+
+def local_target_file_count(target, local_counts_cache):
+    parent_dir = target["save_dir"].parent
+    parent_key = parent_dir.as_posix()
+    if parent_key not in local_counts_cache:
+        local_counts_cache[parent_key] = collect_local_file_counts(parent_dir)
+
+    return local_counts_cache[parent_key].get(target["save_dir"].name, 0)
+
+
+def target_info_key(target):
+    info_root_path = target.get("info_root_path", target["root_path"])
+    return relative_leaf_id(info_root_path, target["leaf_path"])
+
+
+def target_group_prefix(target):
+    info_key = target_info_key(target)
+    if info_key == "_root":
+        return info_key
+    return info_key.split("_", 1)[0]
+
+
+def target_needs_sync(target, local_counts_cache, save_dir_occurrences):
+    if target["prefilter"] == "none":
+        return True
+
+    if target["prefilter"] not in ("count_map", "count_map_prefix_group"):
+        raise ValueError(f"Unknown prefilter: {target['prefilter']}")
+
+    save_dir_key = target["save_dir"].as_posix()
+    if save_dir_occurrences[save_dir_key] > 1:
+        return True
+
+    local_count = local_target_file_count(target, local_counts_cache)
+    return local_count < target["expected_count"]
+
+
+def select_asset_targets_to_update(asset_targets):
+    selected_targets = []
+    local_counts_cache = {}
+    save_dir_occurrences = {}
+    selected_group_prefixes = set()
+
+    for target in asset_targets:
+        save_dir_key = target["save_dir"].as_posix()
+        save_dir_occurrences[save_dir_key] = save_dir_occurrences.get(save_dir_key, 0) + 1
+
+    for target in asset_targets:
+        if target["prefilter"] == "none":
+            selected_targets.append(target)
+            continue
+
+        if target["prefilter"] == "count_map":
+            if target_needs_sync(target, local_counts_cache, save_dir_occurrences):
+                selected_targets.append(target)
+            continue
+
+        if target["prefilter"] == "count_map_prefix_group":
+            if target_needs_sync(target, local_counts_cache, save_dir_occurrences):
+                selected_group_prefixes.add(
+                    (target["root_path"], target_group_prefix(target))
+                )
+            continue
+
+        raise ValueError(f"Unknown prefilter: {target['prefilter']}")
+
+    for target in asset_targets:
+        if target["prefilter"] != "count_map_prefix_group":
+            continue
+
+        group_key = (target["root_path"], target_group_prefix(target))
+        if group_key in selected_group_prefixes:
+            selected_targets.append(target)
+
+    return selected_targets
+
+
+def update_asset_files(client):
+    all_targets = build_asset_targets(client)
+    write_count_map_info_files(all_targets)
+
+    targets_to_update = select_asset_targets_to_update(all_targets)
+    if not targets_to_update:
+        print("All asset targets are already up to date.")
+        return
+
     failed_targets = []
     info_by_group = {}
-    indexed_asset_targets = build_indexed_asset_targets(client)
 
-    for target in indexed_asset_targets:
+    print(f"Found {len(targets_to_update)} asset targets that need syncing:")
+    for target in targets_to_update:
+        print(f"{target['region']}/{target['asset_path']}")
+
+    for target in targets_to_update:
         region = target["region"]
         index_path = target["index_path"]
         asset_path = target["asset_path"]
@@ -383,7 +526,8 @@ def update_indexed_asset_files(client):
                 explorer_assets_url(region, f"{index_path}.json"),
                 label,
             )
-            add_indexed_asset_info(info_by_group, target, remote_files)
+            if target["info_mode"] == "listing":
+                add_indexed_asset_info(info_by_group, target, remote_files)
             if client.download_indexed_directory(
                 remote_files=remote_files,
                 base_url=assets_url(region, f"{asset_path}/"),
@@ -406,65 +550,12 @@ def update_indexed_asset_files(client):
             print(label)
 
 
-def update_live2d_chara_files(client):
-    chara_data, chara_targets = build_live2d_chara_targets(client)
-    write_info_file(chara_data)
-
-    local_counts = collect_local_file_counts(CHARA_ROOT)
-    models_to_update = find_models_to_update(chara_data, local_counts)
-
-    if not models_to_update:
-        print("Live2D chara assets are already up to date.")
-        return
-
-    print(f"Found {len(models_to_update)} live2d models that need syncing:")
-    for chara_id in models_to_update:
-        print(chara_id)
-
-    target_by_id = {target["chara_id"]: target for target in chara_targets}
-    failed_models = []
-
-    print("Downloading missing live2d files ...")
-    for chara_id in models_to_update:
-        target = target_by_id.get(chara_id)
-        if target is None:
-            print(f"[*] Skip: {chara_id} (not present in current asset tree)")
-            continue
-
-        label = chara_id
-        print(f"\n[*] Begin to download: {label}")
-        try:
-            remote_files = client.fetch_indexed_directory_files(
-                explorer_assets_url(target["region"], f"{target['index_path']}.json"),
-                label,
-            )
-            if client.download_indexed_directory(
-                remote_files=remote_files,
-                base_url=assets_url(target["region"], f"{target['asset_path']}/"),
-                save_dir=target["save_dir"],
-                label=label,
-            ):
-                print(f"[*] Success: {label}")
-            else:
-                failed_models.append(label)
-                print(f"[*] Failed: {label}")
-        except Exception as exc:
-            failed_models.append(label)
-            print(f"[*] Failed: {label} ({exc})")
-
-    if failed_models:
-        print("\nFailed live2d models:")
-        for chara_id in failed_models:
-            print(chara_id)
-
-
 def main():
     client = BestdoriClient()
 
     try:
         update_reference_files(client)
-        update_indexed_asset_files(client)
-        update_live2d_chara_files(client)
+        update_asset_files(client)
 
     except requests.exceptions.RequestException as exc:
         print(f"Failed to request: {exc}")
