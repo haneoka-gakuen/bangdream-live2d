@@ -49,7 +49,8 @@ jobs:
           echo "Using endpoint: $R2_ENDPOINT"
           STATE_KEY="live2d/.sync-state/last_synced_sha.txt"
           STATE_FILE="$(mktemp)"
-          ROOT_SYNC_DIRS=(data stamp changedstamp bilibili)
+          LOCAL_LIVE2D_DIR="live2d"
+          ROOT_SYNC_DIRS=(data stamp changedstamp sdchara bilibili)
           EXCLUDED_PATTERNS=(
             ".git/*"
             ".github/*"
@@ -84,6 +85,18 @@ jobs:
             return 0
           }
 
+          is_local_live2d_path() {
+            local p="$1"
+            case "$p" in
+              "$LOCAL_LIVE2D_DIR"/*)
+                return 0
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
           is_root_synced_path() {
             local p="$1"
             local dir
@@ -100,6 +113,8 @@ jobs:
           s3_key_for_path() {
             local p="$1"
             if is_root_synced_path "$p"; then
+              printf '%s\n' "$p"
+            elif is_local_live2d_path "$p"; then
               printf '%s\n' "$p"
             else
               printf 'live2d/%s\n' "$p"
@@ -121,21 +136,47 @@ jobs:
             fi
           }
 
-          sync_live2d_prefix() {
-            local args=(. "s3://${R2_BUCKET}/live2d/" --endpoint-url "$R2_ENDPOINT")
-            local pattern
+          is_root_synced_dir_name() {
+            local name="$1"
             local dir
-
-            for pattern in "${EXCLUDED_PATTERNS[@]}"; do
-              args+=(--exclude "$pattern")
-            done
-
             for dir in "${ROOT_SYNC_DIRS[@]}"; do
-              args+=(--exclude "${dir}/*")
+              if [[ "$name" == "$dir" ]]; then
+                return 0
+              fi
             done
+            return 1
+          }
 
-            args+=(--delete)
-            aws s3 sync "${args[@]}"
+          sync_live2d_prefix() {
+            local staging_dir
+            local entry
+
+            staging_dir="$(mktemp -d)"
+
+            if [[ -d "$LOCAL_LIVE2D_DIR" ]]; then
+              cp -al "${LOCAL_LIVE2D_DIR}/." "$staging_dir/"
+            fi
+
+            while IFS= read -r -d '' entry; do
+              if [[ "$entry" == "$LOCAL_LIVE2D_DIR" ]]; then
+                continue
+              fi
+
+              if is_root_synced_dir_name "$entry"; then
+                continue
+              fi
+
+              if matches_any_pattern "$entry" "${EXCLUDED_PATTERNS[@]}"; then
+                continue
+              fi
+
+              cp -al "$entry" "$staging_dir/"
+            done < <(find . -mindepth 1 -maxdepth 1 -printf '%P\0')
+
+            aws s3 sync "$staging_dir/" "s3://${R2_BUCKET}/live2d/" \
+              --endpoint-url "$R2_ENDPOINT" \
+              --delete
+            rm -rf "$staging_dir"
           }
 
           sync_root_directories() {
@@ -213,14 +254,28 @@ jobs:
                 ;;
               R*)
                 if should_sync_path "$path1"; then
-                  target_key="$(s3_key_for_path "$path1")"
-                  echo "Delete(renamed): $path1 -> $target_key"
-                  aws s3 rm "s3://${R2_BUCKET}/${target_key}" --endpoint-url "$R2_ENDPOINT"
+                  old_target_key="$(s3_key_for_path "$path1")"
+                else
+                  old_target_key=""
                 fi
                 if should_sync_path "$path2"; then
-                  target_key="$(s3_key_for_path "$path2")"
-                  echo "Upload(renamed): $path2 -> $target_key"
-                  aws s3 cp "$path2" "s3://${R2_BUCKET}/${target_key}" --endpoint-url "$R2_ENDPOINT"
+                  new_target_key="$(s3_key_for_path "$path2")"
+                else
+                  new_target_key=""
+                fi
+
+                if [[ -n "$old_target_key" && -n "$new_target_key" && "$old_target_key" == "$new_target_key" ]]; then
+                  echo "Skip local-only rename: $path1 -> $path2 (target unchanged: $new_target_key)"
+                  continue
+                fi
+
+                if [[ -n "$old_target_key" ]]; then
+                  echo "Delete(renamed): $path1 -> $old_target_key"
+                  aws s3 rm "s3://${R2_BUCKET}/${old_target_key}" --endpoint-url "$R2_ENDPOINT"
+                fi
+                if [[ -n "$new_target_key" ]]; then
+                  echo "Upload(renamed): $path2 -> $new_target_key"
+                  aws s3 cp "$path2" "s3://${R2_BUCKET}/${new_target_key}" --endpoint-url "$R2_ENDPOINT"
                 fi
                 ;;
               *)
@@ -231,7 +286,7 @@ jobs:
                 fi
                 ;;
             esac
-          done < <(git -c core.quotePath=false diff --name-status --find-renames -z "$BEFORE" "$AFTER")
+          done < <(git -c core.quotePath=false -c diff.renameLimit=999999 diff --name-status --find-renames=100% -z "$BEFORE" "$AFTER")
 
           if [[ "$change_count" -eq 0 ]]; then
             echo "No changed files, skipping upload."

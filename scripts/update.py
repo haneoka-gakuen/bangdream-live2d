@@ -22,83 +22,42 @@ DEFAULT_HEADERS = {
     "Pragma": "no-cache",
 }
 REQUEST_TIMEOUT = 30
-CHARA_ROOT = Path("chara")
-INFO_FILE = Path("_info.json")
+LOCAL_LIVE2D_ROOT = Path("live2d")
+CHARA_ROOT = LOCAL_LIVE2D_ROOT / "chara"
+INFO_FILE = LOCAL_LIVE2D_ROOT / "_info.json"
 DATA_ROOT = Path("data")
 BESTDORI_BASE_URL = "https://bestdori.com/"
 REGIONS = ("jp", "cn")
-INDEXED_ASSET_TARGETS = (
+DIRECTORY_ASSET_TARGETS = (
     {
         "region": "jp",
-        "index_path": "stamp/01",
-        "asset_path": "stamp/01_rip",
-        "save_dir": Path("stamp/01_rip"),
+        "root_path": "stamp",
+        "save_layout": "split_region",
     },
     {
         "region": "cn",
-        "index_path": "stamp/01",
-        "asset_path": "stamp/01_rip",
-        "save_dir": Path("stamp/cn/01_rip"),
+        "root_path": "stamp",
+        "save_layout": "split_region",
     },
     {
         "region": "jp",
-        "index_path": "changedstamp/001",
-        "asset_path": "changedstamp/001_rip",
-        "save_dir": Path("changedstamp/001_rip"),
+        "root_path": "changedstamp",
+        "save_layout": "split_region",
     },
     {
         "region": "cn",
-        "index_path": "changedstamp/001",
-        "asset_path": "changedstamp/001_rip",
-        "save_dir": Path("changedstamp/cn/001_rip"),
+        "root_path": "changedstamp",
+        "save_layout": "split_region",
     },
     {
         "region": "jp",
-        "index_path": "changedstamp/055",
-        "asset_path": "changedstamp/055_rip",
-        "save_dir": Path("changedstamp/055_rip"),
+        "root_path": "sdchara",
+        "save_layout": "shared",
     },
     {
         "region": "cn",
-        "index_path": "changedstamp/055",
-        "asset_path": "changedstamp/055_rip",
-        "save_dir": Path("changedstamp/cn/055_rip"),
-    },
-    {
-        "region": "jp",
-        "index_path": "changedstamp/056",
-        "asset_path": "changedstamp/056_rip",
-        "save_dir": Path("changedstamp/056_rip"),
-    },
-    {
-        "region": "cn",
-        "index_path": "changedstamp/056",
-        "asset_path": "changedstamp/056_rip",
-        "save_dir": Path("changedstamp/cn/056_rip"),
-    },
-    {
-        "region": "jp",
-        "index_path": "changedstamp/057",
-        "asset_path": "changedstamp/057_rip",
-        "save_dir": Path("changedstamp/057_rip"),
-    },
-    {
-        "region": "cn",
-        "index_path": "changedstamp/057",
-        "asset_path": "changedstamp/057_rip",
-        "save_dir": Path("changedstamp/cn/057_rip"),
-    },
-    {
-        "region": "cn",
-        "index_path": "changedstamp/10001",
-        "asset_path": "changedstamp/10001_rip",
-        "save_dir": Path("changedstamp/cn/10001_rip"),
-    },
-    {
-        "region": "cn",
-        "index_path": "changedstamp/10002",
-        "asset_path": "changedstamp/10002_rip",
-        "save_dir": Path("changedstamp/cn/10002_rip"),
+        "root_path": "sdchara",
+        "save_layout": "shared",
     },
 )
 REFERENCE_FILES = {
@@ -107,14 +66,6 @@ REFERENCE_FILES = {
     "cards.all.5.json": "api/cards/all.5.json",
     "costumes.all.5.json": "api/costumes/all.5.json",
 }
-
-
-def is_bili_chara(chara_id):
-    return (
-        chara_id.startswith("bili_")
-        or chara_id.endswith("_2018_halloween")
-        or "_2019af" in chara_id
-    )
 
 
 def bestdori_url(path):
@@ -127,10 +78,6 @@ def explorer_assets_url(region, path=""):
 
 def assets_url(region, path=""):
     return bestdori_url(f"assets/{region}/{path}")
-
-
-def chara_region(chara_id):
-    return "cn" if is_bili_chara(chara_id) else "jp"
 
 
 def build_session():
@@ -193,23 +140,19 @@ def find_models_to_update(chara_data, local_counts):
 class BestdoriClient:
     def __init__(self):
         self.session = build_session()
+        self.asset_tree_cache = {}
 
     def fetch_json(self, url):
         response = self.session.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         return response.json()
 
-    def fetch_all_chara_info(self):
-        chara_data = {}
-        for region in REGIONS:
-            data = self.fetch_json(explorer_assets_url(region, "_info.json"))
-            for key, value in data.get("live2d", {}).get("chara", {}).items():
-                chara_data.setdefault(key, value)
-
-        return chara_data
-
-    def model_info_url(self, chara_id):
-        return explorer_assets_url(chara_region(chara_id), f"live2d/chara/{chara_id}.json")
+    def fetch_asset_tree(self, region):
+        if region not in self.asset_tree_cache:
+            self.asset_tree_cache[region] = self.fetch_json(
+                explorer_assets_url(region, "_info.json")
+            )
+        return self.asset_tree_cache[region]
 
     def fetch_indexed_directory_files(self, index_url, label):
         remote_files = self.fetch_json(index_url)
@@ -272,27 +215,10 @@ class BestdoriClient:
 
         return all_succeeded
 
-    def download_model(self, chara_id, save_root):
-        try:
-            label = chara_id
-            remote_files = self.fetch_indexed_directory_files(self.model_info_url(chara_id), label)
-            return self.download_indexed_directory(
-                remote_files=remote_files,
-                base_url=assets_url(
-                    chara_region(chara_id), f"live2d/chara/{chara_id}_rip/"
-                ),
-                save_dir=save_root / f"{chara_id}_rip",
-                label=label,
-            )
-        except Exception as exc:
-            print(f"Failed to download {chara_id}: {exc}")
-            return False
-
-
 def write_info_file(chara_data):
     with INFO_FILE.open("w", encoding="utf-8") as file_obj:
         json.dump(chara_data, file_obj, ensure_ascii=False, separators=(",", ":"))
-    print("Updated latest `_info.json`")
+    print(f"Updated `{INFO_FILE.as_posix()}`")
 
 
 def write_json_file(path, data):
@@ -309,7 +235,9 @@ def update_reference_files(client):
 
 
 def add_indexed_asset_info(info_by_group, target, remote_files):
-    group_name, asset_id = target["index_path"].split("/", 1)
+    parts = target["index_path"].split("/", 1)
+    group_name = parts[0]
+    asset_id = parts[1] if len(parts) == 2 else "_root"
     group_info = info_by_group.setdefault(group_name, {})
     region_info = group_info.setdefault(target["region"], {})
     region_info[asset_id] = {
@@ -320,6 +248,119 @@ def add_indexed_asset_info(info_by_group, target, remote_files):
     }
 
 
+def get_asset_tree_node(tree, path):
+    node = tree
+    for part in path.split("/"):
+        if not part:
+            continue
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def iter_leaf_asset_paths(node, prefix):
+    if isinstance(node, dict):
+        for name, child in node.items():
+            child_prefix = f"{prefix}/{name}" if prefix else name
+            yield from iter_leaf_asset_paths(child, child_prefix)
+        return
+
+    yield prefix
+
+
+def asset_path_for_leaf(leaf_path):
+    return f"{leaf_path}_rip"
+
+
+def save_dir_for_leaf(region, leaf_path, save_layout):
+    asset_path = asset_path_for_leaf(leaf_path)
+
+    if save_layout == "shared":
+        return Path(asset_path)
+
+    if save_layout == "split_region":
+        if region == "jp":
+            return Path(asset_path)
+
+        group_name, rest = leaf_path.split("/", 1)
+        return Path(group_name) / region / f"{rest}_rip"
+
+    raise ValueError(f"Unknown save layout: {save_layout}")
+
+
+def expand_directory_asset_target(client, target):
+    region = target["region"]
+    root_path = target["root_path"]
+    save_layout = target["save_layout"]
+    tree = client.fetch_asset_tree(region)
+    node = get_asset_tree_node(tree, root_path)
+    if node is None:
+        raise ValueError(f"Directory asset target not found: {region}/{root_path}")
+
+    expanded_targets = []
+    for leaf_path in iter_leaf_asset_paths(node, root_path):
+        expanded_targets.append(
+            {
+                "region": region,
+                "index_path": leaf_path,
+                "asset_path": asset_path_for_leaf(leaf_path),
+                "save_dir": save_dir_for_leaf(region, leaf_path, save_layout),
+            }
+        )
+
+    return expanded_targets
+
+
+def build_indexed_asset_targets(client):
+    targets = []
+    for target in DIRECTORY_ASSET_TARGETS:
+        targets.extend(expand_directory_asset_target(client, target))
+
+    deduped_targets = []
+    seen = set()
+    for target in targets:
+        key = (
+            target["region"],
+            target["index_path"],
+            target["asset_path"],
+            target["save_dir"].as_posix(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_targets.append(target)
+
+    return deduped_targets
+
+
+def build_live2d_chara_targets(client):
+    chara_data = {}
+    targets = []
+
+    for region in REGIONS:
+        chara_node = get_asset_tree_node(client.fetch_asset_tree(region), "live2d/chara")
+        if not isinstance(chara_node, dict):
+            raise ValueError(f"Missing live2d/chara asset tree for region: {region}")
+
+        for chara_id, expected_count in sorted(chara_node.items()):
+            if chara_id in chara_data:
+                continue
+
+            chara_data[chara_id] = expected_count
+            targets.append(
+                {
+                    "region": region,
+                    "chara_id": chara_id,
+                    "index_path": f"live2d/chara/{chara_id}",
+                    "asset_path": f"live2d/chara/{chara_id}_rip",
+                    "save_dir": CHARA_ROOT / f"{chara_id}_rip",
+                }
+            )
+
+    return chara_data, targets
+
+
 def write_indexed_asset_info_files(info_by_group):
     for group_name, group_info in info_by_group.items():
         write_json_file(Path(group_name) / "_info.json", group_info)
@@ -328,8 +369,9 @@ def write_indexed_asset_info_files(info_by_group):
 def update_indexed_asset_files(client):
     failed_targets = []
     info_by_group = {}
+    indexed_asset_targets = build_indexed_asset_targets(client)
 
-    for target in INDEXED_ASSET_TARGETS:
+    for target in indexed_asset_targets:
         region = target["region"]
         index_path = target["index_path"]
         asset_path = target["asset_path"]
@@ -364,41 +406,65 @@ def update_indexed_asset_files(client):
             print(label)
 
 
+def update_live2d_chara_files(client):
+    chara_data, chara_targets = build_live2d_chara_targets(client)
+    write_info_file(chara_data)
+
+    local_counts = collect_local_file_counts(CHARA_ROOT)
+    models_to_update = find_models_to_update(chara_data, local_counts)
+
+    if not models_to_update:
+        print("Live2D chara assets are already up to date.")
+        return
+
+    print(f"Found {len(models_to_update)} live2d models that need syncing:")
+    for chara_id in models_to_update:
+        print(chara_id)
+
+    target_by_id = {target["chara_id"]: target for target in chara_targets}
+    failed_models = []
+
+    print("Downloading missing live2d files ...")
+    for chara_id in models_to_update:
+        target = target_by_id.get(chara_id)
+        if target is None:
+            print(f"[*] Skip: {chara_id} (not present in current asset tree)")
+            continue
+
+        label = chara_id
+        print(f"\n[*] Begin to download: {label}")
+        try:
+            remote_files = client.fetch_indexed_directory_files(
+                explorer_assets_url(target["region"], f"{target['index_path']}.json"),
+                label,
+            )
+            if client.download_indexed_directory(
+                remote_files=remote_files,
+                base_url=assets_url(target["region"], f"{target['asset_path']}/"),
+                save_dir=target["save_dir"],
+                label=label,
+            ):
+                print(f"[*] Success: {label}")
+            else:
+                failed_models.append(label)
+                print(f"[*] Failed: {label}")
+        except Exception as exc:
+            failed_models.append(label)
+            print(f"[*] Failed: {label} ({exc})")
+
+    if failed_models:
+        print("\nFailed live2d models:")
+        for chara_id in failed_models:
+            print(chara_id)
+
+
 def main():
     client = BestdoriClient()
 
     try:
         update_reference_files(client)
         update_indexed_asset_files(client)
-
-        chara_data = client.fetch_all_chara_info()
-        write_info_file(chara_data)
-
-        local_counts = collect_local_file_counts(CHARA_ROOT)
-        models_to_update = find_models_to_update(chara_data, local_counts)
-
-        if not models_to_update:
-            print("Already up to date.")
-            return
-
-        print(f"Found {len(models_to_update)} models that need syncing:")
-        for chara_id in models_to_update:
-            print(chara_id)
-
-        failed_models = []
-        print("Downloading missing files ...")
-        for chara_id in models_to_update:
-            print(f"\n[*] Begin to download: {chara_id}")
-            if client.download_model(chara_id, CHARA_ROOT):
-                print(f"[*] Success: {chara_id}")
-            else:
-                failed_models.append(chara_id)
-                print(f"[*] Failed: {chara_id}")
-
-        if failed_models:
-            print("\nFailed models:")
-            for chara_id in failed_models:
-                print(chara_id)
+        update_live2d_chara_files(client)
 
     except requests.exceptions.RequestException as exc:
         print(f"Failed to request: {exc}")
