@@ -1,0 +1,322 @@
+# 卡池(Gacha)闪退专项 — 内存优化建议
+
+> 现象: 进入卡池(GachaTop)与抽卡演出/结果界面 频繁闪退
+> 范围: `star/Assets/star/Scripts/Gacha/`、`star/Assets/star/Scripts/Screen/ScreenLayers/ScreenLayerGacha*.cs`、`NewSituationIntroduction/`、卡池相关 Dialog
+> 配套阅读: 仓库根 `MEMORY_OPTIMIZATION.md`(全局优化)与 `OPTIMIZATION_SKILL.md`(方法论)
+
+---
+
+## 0. 闪退峰值复盘
+
+抽卡链路存在 **三个明显的内存峰值**,从入口到一连结束依次叠加:
+
+```
+GachaTop          一次性实例化所有有效卡池的 GachaScreen + 视频/特效预加载
+   │
+   ▼
+GachaConfirmDialog   每次 Resources.Load PaidStoneReminders prefab,无 Unload
+   │
+   ▼
+GachaSpin           三幕 Animator 全开 + 10 张抽到卡 SpinSceneData + 12 个 UITextureLoader + 视频 prefab
+   │
+   ▼
+NewSituationIntroduction  每抽到的角色加载 3 张完整大图(CharacterSituation/BandBg/IntroText) + costume Live2D + bandLogo + voice
+   │
+   ▼
+GachaResult        UIGrid 一次性 Instantiate 10 个 ThumbnailL,常驻 cacheMap
+```
+
+**链路上的释放点几乎全集中在 `GachaExecutor.cs:312-315` 的一次 `UnloadUnusedAssets + GC.Collect`**(仅 Spin → Result 之间触发);而 GachaTop OnExit、GachaSpin OnExit、GachaResult OnDispose、二次抽卡入口都没有兜底。链路越长,叠加越严重,低端机在 NewSituationIntroduction 与 GachaSpin 之间最容易爆。
+
+---
+
+## 1. 关键问题清单
+
+下表按峰值贡献 + 修复 ROI 排序。每行带证据。
+
+### 1.1 GachaTop 进入时的"全量预加载"
+
+| # | 问题 | 证据 |
+|---|------|------|
+| T1 | 进入 GachaTop 一次性为 **所有有效卡池** 创建 ViewController,逐个 `LoadResource<GameObject>("screen.prefab")` + `Instantiate` GachaScreen,数量随活动期卡池数量线性增长 | `Screen/ScreenLayers/ScreenLayerGachaTop.cs:775-815`; `Gacha/GachaViewController/GachaViewControllerBase.cs:264,273,281` |
+| T2 | 含视频的卡池在 GachaTop 启动时立即 `new GachaTopAnimationMovieController` 并对所有 movieResource 创建 CriManaSingle,所有卡池并行 `DownloadResources / CreateLocalFiles / Prepare` | `ScreenLayerGachaTop.cs:370-378`;`GachaViewControllerBase.cs:287-292`,`:2119-2130`;`Gacha/AnimationEpisodeGacha/GachaTopAnimationMovieController.cs:47-60`,`:102-108` |
+| T3 | `BandSelectGachaViewController.SetBandSelectGachaAppealImage` 用 `BandLogoLoader.SetLoadOption(true,false,false,false)`(doCache=true 且 **unloadAB=false**),进入页就加载 5 张 pickup_*.png + bg_*.png,且切 band 后旧贴图无 `UnloadAsset` | `Gacha/GachaViewController/BandSelectGachaViewController.cs:91-95`,`:48-57`,`:215-243`;`Gacha/GachaScreen.cs:262-277` |
+| T4 | `GachaScreen.Destory()` 仅释放 `useResources` 与 `logoTexture`,**不释放** `appealImages.mainTexture` / `bgTexture.mainTexture` / `gachaSealAppealTexture` / `screenParticles` | `Gacha/GachaScreen.cs:120-133` |
+| T5 | `GachaTabPageBase.Show()` 首次创建 tab 后不卸载;打开抽卡详情 Dialog 时 `GachaTabPageListFactory.Create` 一次性 Instantiate 该卡池所有 Tab Page | `Gacha/GachaDetailTabPage/GachaTabPageBase.cs:57-74`;`Gacha/GachaUtility.cs:198-218`;`GachaTabPageListFactory.cs:43-57` |
+| T6 | `GachaCell.Setup` 时即时 `attentionTextureLoader.Load`,卡池列表全部一次性加载 attention 图(无视口/分页) | `Gacha/GachaCell.cs:35-66`;`ScreenLayerGachaTop.cs:874-899` |
+| T7 | 通过 `PushUIScreen(GachaTop)` 入栈而非 Change,**前一画面(Home/Menu)资源仍驻栈中** | `Gacha/GachaUtility.cs:23-50`;`Screen/ScreenLayers/ScreenLayerHome.cs:4243` |
+
+### 1.2 GachaConfirmDialog / 抽卡前对话框
+
+| # | 问题 | 证据 |
+|---|------|------|
+| C1 | `PaidStoneReminder` 每次显示走 `Resources.Load<GameObject>("biliPrefab/PaidStoneReminders")`,Destroy 实例后 prefab 资源不释放 | `Dialog/DialogScript/Gacha/GachaConfirmDialog.cs:237-260` |
+
+### 1.3 GachaSpin 演出的释放盲区(已被注释明确警告)
+
+> 注释自陈"ガチャ演出はメモリ消費が大きい"(`ScreenLayerGachaSpin.cs:208`),但实际释放路径残缺。
+
+| # | 问题 | 证据 |
+|---|------|------|
+| S1 | `GachaSpinController.Initialize` 把 Scene1/2/3 三幕 Animator 同时 `SetActive(true)`,10 连过程三幕全部驻留 | `Gacha/Spin/GachaSpinController.cs:155-167` |
+| S2 | 每张抽到卡 `Atria.LoadResourceAsync<GachaSpinSceneData>(characterResourceSet AB)`,10 连即 10 份 SpinSceneData(含贴图/动画引用),**全程无 UnloadCache** | `GachaSpinController.cs:213-239`,`:233-238` |
+| S3 | `GachaSpinScene3` 含 12 个 `UITextureLoader`(charaR/Star3/Star4/Star5Base/Eff/Blur×3);`OnFinishAnimation` 仅 Unload R/Star3/Star4,**Star5 的 9 个 loader 不释放** | `Gacha/Spin/GachaSpinScene3.cs:28-52`,`:1060-1083`,`:1172-1177` |
+| S4 | 星 5 卡 1 张大图(从 `Atria` 加载)被 9 个 `UITextureLoader` 共享 mainTexture(Base/Eff/Blur×3),**没有任何路径调 `Atria.UnloadCache` 这张大图所属 bundle** | `GachaSpinScene3.cs:617`,`:833-841` |
+| S5 | `GachaSpinScene3.Awake` 同步 `Resources.Load` 4 个 prefab(GachaText/GachaPrefixText/GachaPrefixText_Additive/GachaShare)+ MoviePlayer prefab,**全程无 `Resources.UnloadAsset`** | `GachaSpinScene3.cs:205-217`;`Movie/AnimationEpisodeMoviePlayer.cs:650-660` |
+| S6 | `GachaSpinScene3.CaptureScreen` 每次分享 `new Texture2D(Screen.w, Screen.h, RGB24)`,**写完 PNG 不 Destroy**,按用户点击次数累积 | `GachaSpinScene3.cs:271-292` |
+| S7 | `Common/ResourceContainer.Unload()` 已被人为掏空(注释"不再 Unload");`GachaSpinController.UnloadResources` 调用它实际 no-op,只 `RemoveGachaSpinVoiceBundles` 起效 | `Common/ResourceContainer.cs:73-81`;`GachaSpinController.cs:613-622` |
+| S8 | 动画 episode 卡每张 `Instantiate` 一份 `AnimationEpisodeMoviePlayer` 并 `LoadAsync`,前一张才 Destroy,瞬时叠加 | `GachaSpinScene3.cs:1182-1198`,`:1244` |
+| S9 | `GachaPsylliumManager.destroyPsyllium` 走 `OnValidate` 编辑器路径,运行期未在 OnDestroy 主动清理(依赖 GameObject 一并销毁) | `Gacha/Spin/GachaPsylliumManager.cs:77-100`,`:107-140`,`:147-166` |
+| S10 | `GachaScreenParticleController.FadeOutChildren` 已注释失效("一旦未实装"),粒子靠 `SetActive(false)`,贴图引用仍在 | `Gacha/GachaScreenParticleController.cs:14-46` |
+
+### 1.4 NewSituationIntroduction(抽到新卡的全屏立绘)
+
+| # | 问题 | 证据 |
+|---|------|------|
+| N1 | 每抽到的角色顺序加载 3 张完整大图(CharacterSituation 完整卡面 / BandBackground / IntroductionText)+ costume Live2D bundle + bandLogo prefab + gachaLogo + voice bundles | `NewSituationIntroduction/SequentialNewSituationIntroductionController.cs:163-231`;`NewSituationIntroduction/NewSituationIntroductionExecutor.cs:128-198` |
+| N2 | `NewSituationIntroductionExecutor.UnloadResources` **只 Dispose CharacterSituation bundle**,band background / gacha logo / introduction text / costume Live2D / bandLogo 全部不释放,持续累积 | `NewSituationIntroductionExecutor.cs:171-178`,`:208-224` |
+
+### 1.5 GachaResult(10 张缩略图同时常驻)
+
+| # | 问题 | 证据 |
+|---|------|------|
+| R1 | `ScreenLayerGachaResult` 用 **UIGrid + 全量 Instantiate**,**不是 ScrollView 复用**,10 个 thumbPrefab 一次性创建,L 尺寸 thumbnail 全量驻留 `SpotAssetManager.cacheMap` | `Screen/ScreenLayers/ScreenLayerGachaResult.cs:22-25`,`:202-257`,`:207`(`SetThumbnailSize(L)`) |
+| R2 | `OnDispose` 仅遍历 `cards` 对 `Status==Success` 的 thumb 调 `Unload`,**Loading 中的 thumbnail 不会取消/释放**;关闭时 **未** 触发 `Resources.UnloadUnusedAssets` | `ScreenLayerGachaResult.cs:155-169` |
+| R3 | `clearSituationThumbnails` 只 `Destroy(ct.gameObject)` 不释放贴图 | `ScreenLayerGachaResult.cs:374-389` |
+| R4 | `CardThumbnail.LoadThumbnail` 走 `SetLoadOption(true,false,false,false)` → 默认进 `SpotAssetManager.cacheMap`(已知此 cacheMap 不自动释放) | `Item/Card/CardThumbnail.cs:774-798`;`Common/UIComponent/UITextureLoader.cs:303-314`;`Common/SpotAssetManager.cs:707,1611-1654` |
+
+### 1.6 GachaReceiveItemDialog / Inherit Result(累积奖励)
+
+| # | 问题 | 证据 |
+|---|------|------|
+| I1 | `GachaReceiveItemCell` 走 `PlayerResourceUtility.CreateThumbnail`,可能触发 ItemThumbnail bundle 加载,关闭时无显式 Unload | `Gacha/Result/GachaReceiveItemCell.cs:30-41`;`Dialog/DialogScript/Gacha/GachaReceiveItemDialog.cs:62-68` |
+| I2 | `GachaInheritResultDialog` 一次性 Instantiate 三类 prefab(无图片影响小,仍是体积) | `Dialog/DialogScript/Gacha/GachaInheritResultDialog.cs:66-69`;`Gacha/GachaInheritResult/GachaInheritResultCellViewFactory.cs:69-95` |
+
+### 1.7 场景流转兜底缺口
+
+| # | 问题 | 证据 |
+|---|------|------|
+| F1 | `ScreenLayerGachaTop.OnExit` 仅 `unloadResources + live2DController.Exited` + 关闭 movie alpha,**不调** `Resources.UnloadUnusedAssets / Atria.DisposeAllAssetBundle / GC.Collect` | `ScreenLayerGachaTop.cs:434-443`,`:858-869` |
+| F2 | `ScreenLayerGachaSpin.OnExit` 同样 **不调** `UnloadUnusedAssets/GC` | `ScreenLayerGachaSpin.cs:203-219` |
+| F3 | `ScreenLayerGachaResult.OnDispose` **不调** `UnloadUnusedAssets/GC`;Result 返回 GachaTop 用 `ChangeUIScreen(GachaTop)` 重建所有 ViewController(峰值再来一次) | `ScreenLayerGachaResult.cs:155-169`,`:597-600` |
+| F4 | 抽完一连后 `GachaExecutor.showGachaResult` 是链路上 **唯一显式** 调 `UnloadUnusedAssets + GC.Collect` 的位置;再抽时 `ChangeUIScreen(GachaSpin)` 重启演出,旧 SpinTop prefab 重新 `Atria.LoadResource` 一份 | `Gacha/GachaExecutor.cs:312-315`,`:60-62`,`:67-75`;`ScreenLayerGachaSpin.cs:122` |
+
+---
+
+## 2. 最小改动收益最大的 P0 改造(优先级)
+
+下面 6 项做完,预期能消除"进卡池/抽卡过程中突然挂"的绝大多数 case。每一项都聚焦在已确认的释放盲区,改动面小、风险可控。
+
+### P0-1 在三个 ScreenLayer 出口加内存兜底
+
+**位置**:
+- `ScreenLayerGachaTop.cs:434-443` `OnExit` 末尾
+- `ScreenLayerGachaSpin.cs:203-219` `OnExit` 末尾
+- `ScreenLayerGachaResult.cs:155-169` `OnDispose` 末尾
+
+**做法**: 退出动作完成后,等帧调用:
+
+```
+yield return null; // 等待 Destroy 完成
+Resources.UnloadUnusedAssets();
+yield return null;
+System.GC.Collect();
+System.GC.WaitForPendingFinalizers();
+```
+
+把"只在 GachaExecutor.showGachaResult 调一次"扩展到三个出口都调。**这是单点改动收益最大的位置**——挡住三段链路的累积。
+
+### P0-2 修复 GachaSpinScene3 的 Star5 释放遗漏
+
+**位置**: `GachaSpinScene3.cs:1060-1083` `OnFinishAnimation` 与 `:1172-1177` `DestroyTextureLoaders`
+
+**做法**:
+1. 在 `OnFinishAnimation` 内,星 5 路径补 `Star5BaseLoader[i].Unload(); Star5EffLoader[i].Unload(); Star5BlurLoader[i].Unload();` 共 9 处。
+2. `DestroyTextureLoaders` 内同样追加 Star5 那 9 个 loader 的 OnDestroy。
+3. 因为 9 个 loader 共享同一 mainTexture 的 bundle,需要在最后一个 loader Unload 后再调一次 `Atria.UnloadCache(bundleName, fileName)`(可由 `UITextureLoader.Unload` 内部走);若 `Atria.UnloadCache` 引用计数已正确处理共享,9 次 `Unload` 自然会让计数归零。
+
+### P0-3 NewSituationIntroductionExecutor.UnloadResources 补全
+
+**位置**: `NewSituationIntroductionExecutor.cs:171-178`,`:208-224`
+
+**做法**: 现在只 Dispose CharacterSituation,把以下也加入 Dispose:
+- bandBackground bundle
+- gachaLogo bundle
+- introductionText bundle
+- costume Live2D bundle(关键大头)
+- bandLogo bundle
+- voice bundles(若已有 RemoveGachaSpinVoiceBundles 模式则同样处理)
+
+**检查点**: 若有"返回时再次进入需要这些资源"的场景,改成 `OnDispose` 时释放(和现在一致),而不是放在 OnExit。
+
+### P0-4 修补 GachaResult 释放与改用 ScrollView 复用
+
+短期最小化改动:
+- `OnDispose` 内追加 `cards.Clear()` 前对所有 cards(无论 Status)调 `Unload()` —— 让 Loading 中的也走释放;然后 `Resources.UnloadUnusedAssets()`(P0-1 已含)
+- `clearSituationThumbnails` 内每个 `ct` 在 `Destroy(ct.gameObject)` 前调 `ct.UnloadAndDestroy()`(若有该 API,否则手动 `ct.Unload()`)
+
+中期改造(P1):把 UIGrid 改 RecycleScroll(项目里有 `RecycleScroll`),只渲染当前 ±2 张,瞬时贴图占用从 10 张降到 ~3 张。
+
+### P0-5 GachaTop 视频/卡池预加载延迟化
+
+**位置**: `ScreenLayerGachaTop.cs:370-378`,`:775-815`;`GachaViewControllerBase.cs:287-292`
+
+**做法**:
+1. `createGachaViewControllers` 仍然为每条卡池创建 ViewController(轻量),但 `InitializeScreen / InstantiateMovieControllers` 改为"显示当前 tab 时再创建"。
+2. CriManaSingle/视频 `Prepare` 仅对当前可见卡池调用,切 tab 时 Dispose 上一个、Prepare 下一个。
+3. `GachaCell.attentionTextureLoader.Load` 改为可见时再加载(Cell 进入视口的回调中触发)。
+
+收益: 卡池数 = 8-15 时,GachaTop 进入瞬间峰值能降一倍以上。
+
+### P0-6 BandSelect 5 张 pickup/bg 释放与 unloadAB 修正
+
+**位置**: `BandSelectGachaViewController.cs:91-95`,`:48-57`,`:215-243`;`GachaScreen.cs:262-277`
+
+**做法**:
+1. 切换 band 调用 `SetBandSelectGachaAppealImage` 前,对**旧的** `appealImages[i].mainTexture` 与 `bgTexture.mainTexture` 调 `Resources.UnloadAsset`(若是 Atria bundle 资源则 `Atria.UnloadCache`)。
+2. `BandLogoLoader.SetLoadOption(true,false,false,false)` 中的 **unloadAB=false 改为 true**(确认是否真有"留缓存以便回切" 的诉求,若有,改为 LRU 上限 2)。
+3. `GachaScreen.Destory` 把 `appealImages` / `bgTexture` / `gachaSealAppealTexture` / `screenParticles` 也加入 `useResources` 对应的释放表。
+
+---
+
+## 3. P1 改造(中等收益,改动面稍大)
+
+| # | 改造 | 收益 | 改动面 |
+|---|------|------|--------|
+| P1-1 | `GachaSpinScene3.Awake` 的 `Resources.Load` 4 个 prefab 改为 `Atria.LoadResourceAsync` + 进入 OnExit 时 Dispose;或者 `Resources.UnloadAsset` 配对 | 稳态 -几 MB | `GachaSpinScene3.cs:205-217` |
+| P1-2 | `GachaSpinScene3.CaptureScreen` 截屏 `Texture2D` 写完 PNG 立刻 `UnityEngine.Object.Destroy(screenShot)`;若需保留预览,缓存 1 张并复用 | 防止用户多次点击分享累积 | `GachaSpinScene3.cs:271-292` |
+| P1-3 | `ResourceContainer.Unload()` 恢复实现(或彻底删除该路径,改为 GachaSpinController 直接管理资源列表) | 让 `UnloadResources` 真起作用 | `Common/ResourceContainer.cs:73-81`;`GachaSpinController.cs:613-622` |
+| P1-4 | `GachaConfirmDialog.PaidStoneReminder` 改用 `Atria.LoadResourceAsync` + Dialog Close 时 Dispose;或缓存 prefab 引用为弱引用 | 防止重复抽卡时累积 | `GachaConfirmDialog.cs:237-260` |
+| P1-5 | `GachaTabPageListFactory.Create` 改为 lazy(切换 Tab 时再 Instantiate 当前 tab,关 Dialog 时统一 Destroy) | 详情 Dialog 峰值降低 | `GachaTabPageListFactory.cs:43-57`;`GachaTabPageBase.cs:57-74` |
+| P1-6 | `GachaSpinController.Initialize` 三幕 Animator 改按需 SetActive(只激活当前要播的那幕) | 减少 Animator 状态机/动画曲线持有 | `GachaSpinController.cs:155-167` |
+| P1-7 | `GachaTopAnimationMovieController` 视频 Prepare 改为只对**当前可见卡池**预备,其余 lazy | 显著降 GachaTop 启动峰值 | `GachaTopAnimationMovieController.cs:47-60`,`:102-108` |
+| P1-8 | `GachaCell.attentionTextureLoader` 进入视口时再 Load,`OnDespawn` 时 Unload(配合 RecycleScroll) | 卡池列表内存随屏数线性 | `GachaCell.cs:35-66`;`ScreenLayerGachaTop.cs:874-899` |
+| P1-9 | `GachaPsylliumManager` 加 `OnDestroy` 主动释放 prefab 与 UITexture | 防止运行期 Editor 路径不生效 | `GachaPsylliumManager.cs:77-166` |
+| P1-10 | `GachaScreenParticleController.FadeOutChildren` 实装/或 OnDestroy 主动 Destroy 粒子贴图引用 | 多次抽卡粒子累积 | `GachaScreenParticleController.cs:14-46` |
+
+---
+
+## 4. P2(架构层 / 大改)
+
+| # | 改造 | 备注 |
+|---|------|------|
+| P2-1 | `ScreenLayerGachaResult` 改 ScrollView 复用(仅 ±2 张),Cell 走 OnSpawn/OnDespawn 释放 thumbnail | 与全局 ThumbnailFactory/CardThumbnail 改造同步 |
+| P2-2 | `GachaTop` 卡池数据驱动按 Tab 分页(同一时间只有 1-2 个 GachaScreen 实例化) | 与产品/UI 协商 |
+| P2-3 | NewSituationIntroduction 的多角色全屏立绘改流式播放(每个角色播完立即释放上一个) | 演出节奏需协调 |
+| P2-4 | 把 GachaTop / Spin / Result 改为 `ChangeUIScreen` 而非 `PushUIScreen`(参考 `GachaUtility.cs:23` 现状),避免 Home 栈中常驻 | 影响返回路径,需测交互 |
+
+---
+
+## 5. 测量指标(改造前后必测)
+
+针对卡池闪退专项,推荐打点:
+
+| 节点 | 指标 |
+|------|------|
+| 进入 GachaTop 前 | 总占用基线 |
+| GachaTop OnEnter 完成 | 峰值 vs 基线差 |
+| GachaConfirm Dialog 打开 | 增量 |
+| GachaSpin OnEnter | 峰值(关键观测点 1) |
+| 第 N 张 cutin(N=5/10) | 增量(看星 5 是否累积) |
+| NewSituationIntroduction 各角色 | 峰值(关键观测点 2) |
+| GachaResult OnEnter | 峰值(关键观测点 3) |
+| GachaResult OnDispose 后 | 应回到 GachaTop OnEnter 水位 ±50 MB |
+| 重复抽 5 次后回到 GachaTop | 应回到首次基线 ±100 MB(否则有累积) |
+
+打点用 `Profiler.GetTotalReservedMemoryLong / GetTotalAllocatedMemoryLong` + Android `Debug.GetNativeHeapSize` + iOS `os_proc_available_memory`。
+
+**关键回归用例**:
+- 一连抽 → 看完 → 返回 GachaTop → 再抽一连 ×10 次,检查峰值不漂移
+- 切 BandSelect 卡池的不同 band ×5 次,检查贴图增量
+- 进 GachaTop → 切所有 Tab 详情 Dialog ×3 轮,检查内存
+
+---
+
+## 6. 改造路线图(Sprint 拆分)
+
+### Sprint 1(本周,P0-1 + P0-2 + P0-3 + P0-6 + P1-2)
+
+锁定低改动面、零产品决策、纯代码补漏:
+
+1. 三个 ScreenLayer 出口加 `UnloadUnusedAssets + GC.Collect`(P0-1)
+2. GachaSpinScene3 的 Star5 9 个 loader Unload(P0-2)
+3. NewSituationIntroduction 5 类 bundle 全部 Dispose(P0-3)
+4. BandSelect 切 band 的旧贴图释放 + `unloadAB=true`(P0-6)
+5. CaptureScreen 截屏 Texture2D Destroy(P1-2)
+
+**验收**:Sprint 1 后,在 3GB 设备上完成"GachaTop → 一连抽 → Result → 再抽 → Result"完整循环 ×3 不闪退,峰值漂移 < 100 MB。
+
+### Sprint 2(2 周,P0-4 + P0-5 + P1-1 + P1-4 + P1-7)
+
+1. GachaResult Loading 状态也释放 + UIGrid → RecycleScroll(P0-4 + P2-1 短版)
+2. GachaTop 视频/卡池延迟化(P0-5 + P1-7)
+3. GachaSpinScene3 prefab 资源走 Atria + 释放(P1-1)
+4. PaidStoneReminder 改 Atria(P1-4)
+
+**验收**:GachaTop OnEnter 峰值降 30%+;Result 峰值降 50%+(10 → ~3 张同时常驻)。
+
+### Sprint 3(后续,P1-3/P1-5/P1-6/P1-8/P1-9/P1-10 + P2)
+
+按余量推进。
+
+---
+
+## 7. 关键证据快查(供改造时直接定位)
+
+```
+Gacha 入口 / 流转
+  Gacha/GachaUtility.cs:23-50                      Push 入栈
+  Gacha/GachaExecutor.cs:67-75,107,288-291,312-315 changeGachaSpinScreen / showGachaResult / 唯一 Unload 点
+
+GachaTop
+  Screen/ScreenLayers/ScreenLayerGachaTop.cs:370-378   movie 全卡池预备
+  Screen/ScreenLayers/ScreenLayerGachaTop.cs:434-443   OnExit 缺兜底
+  Screen/ScreenLayers/ScreenLayerGachaTop.cs:775-815   全卡池 ViewController 实例化
+  Screen/ScreenLayers/ScreenLayerGachaTop.cs:858-869   unloadResources
+  Screen/ScreenLayers/ScreenLayerGachaTop.cs:874-899   全卡池 cell 创建
+  Gacha/GachaViewController/GachaViewControllerBase.cs:225-253,264-292,2119-2130
+  Gacha/GachaViewController/BandSelectGachaViewController.cs:48-57,91-95,215-243
+  Gacha/GachaScreen.cs:18-44,120-133,262-277
+  Gacha/AnimationEpisodeGacha/GachaTopAnimationMovieController.cs:47-60,102-108,185-191
+  Gacha/GachaCell.cs:35-66
+  Gacha/GachaDetailTabPage/GachaTabPageBase.cs:57-74
+  Gacha/GachaUtility.cs:198-218
+  Gacha/GachaTabPageListFactory.cs:43-57
+
+GachaConfirm
+  Dialog/DialogScript/Gacha/GachaConfirmDialog.cs:237-260   Resources.Load 无 Unload
+
+GachaSpin
+  Screen/ScreenLayers/ScreenLayerGachaSpin.cs:72-75,122,146,203-219
+  Gacha/Spin/GachaSpinController.cs:123-167,177-203,213-239,613-630
+  Gacha/Spin/GachaSpinScene3.cs:28-52,205-217,271-292,617,833-841,1060-1083,1172-1177,1182-1198,1244
+  Gacha/Spin/GachaPsylliumManager.cs:77-166
+  Gacha/GachaScreenParticleController.cs:14-46
+  Common/ResourceContainer.cs:73-81                    Unload no-op
+  Movie/AnimationEpisodeMoviePlayer.cs:650-660         Resources.Load MoviePlayer prefab
+
+NewSituationIntroduction
+  NewSituationIntroduction/SequentialNewSituationIntroductionController.cs:137-181,163-231
+  NewSituationIntroduction/NewSituationIntroductionExecutor.cs:70-71,128-198,171-178,208-224
+
+GachaResult
+  Screen/ScreenLayers/ScreenLayerGachaResult.cs:22-25,108-111,155-169,202-257,374-389,597-600
+  Item/Card/CardThumbnail.cs:774-798
+  Common/UIComponent/UITextureLoader.cs:303-314
+  Common/SpotAssetManager.cs:707,1611-1654
+  Dialog/DialogScript/Gacha/GachaReceiveItemDialog.cs:62-68
+  Gacha/Result/GachaReceiveItemCell.cs:30-41
+  Dialog/DialogScript/Gacha/GachaInheritResultDialog.cs:66-69
+  Gacha/GachaInheritResult/GachaInheritResultCellViewFactory.cs:69-95
+  Gacha/GachaShortage/GachaShortageView.cs:97-109
+```
+
+---
+
+## 8. 与 `MEMORY_OPTIMIZATION.md` 的关系
+
+本文是全局优化中"卡池"这一垂直切片的下钻。若已实施全局 P0:
+
+- 全局 `StarSceneManager` 转场兜底 → 不会触发(本卡池流程在主场景内 ScreenLayer 切换,不走场景兜底)。**所以本文 P0-1 的三处 ScreenLayer 出口兜底必须独立实施。**
+- 全局 `Application.lowMemory` 监听 → 对卡池流程是兜底,但属"最后一道",不可替代本文的精细修补。
+- 全局 `masterTextureLimit=1` 低端机降级 → 对卡池所有大图(卡面/banner/立绘/cutin)直接生效一倍降幅,**与本文 P0 叠加**,推荐先开降级再做精细修补。
